@@ -1,0 +1,38 @@
+# 环境变量与密钥：未来如需 apikey / token 等敏感配置，统一放 .env（绝不提交）
+.env
+.env.*
+!.env.example
+
+# 虚拟环境
+.venv/
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# 运行时数据：浏览器登录态、数据库、截图、日志（含隐私，绝不提交）
+data/
+logs/
+artifacts/
+profiles/
+
+# 数据库文件
+*.sqlite
+*.sqlite3
+*.db
+
+# 本地 Claude 配置
+.claude/
+
+# IDE 配置
+.idea/
+.vscode/
+
+# 日志
+*.log
