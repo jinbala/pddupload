@@ -148,7 +148,47 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--delay-seconds", type=float, default=10.0, help="每个草稿之间停顿秒数（防风控，实际随机 1~2 倍）")
 
     subparsers.add_parser("menu", help="交互式菜单（一键启动）")
+
+    subparsers.add_parser(
+        "login",
+        help="单独打开浏览器登录 17zwd（强制有头模式，登录态持久化）",
+    )
     return parser
+
+
+async def _ensure_authenticated(page_obj, settings: Settings) -> None:
+    """检测登录态。无头模式下登录失效无法人工扫码，直接报错并提示去登录；有头模式提示人工登录。"""
+    if await page_obj.is_login_page():
+        if settings.headless:
+            raise RuntimeError(
+                "登录已失效：当前是后台无头模式，无法弹出浏览器登录。"
+                "请先双击「登录账号.bat」完成登录，再重新运行。"
+            )
+        print("请在打开的浏览器中完成 17zwd 登录。")
+    await page_obj.wait_until_authenticated()
+
+
+async def login(settings: Settings) -> int:
+    """单独登录：强制有头模式，打开浏览器让用户完成 17zwd 登录，登录态写入本地 profile。"""
+    settings.headless = False  # 登录必须可见（扫码 / 验证码）
+    async with BrowserSession(settings).open() as (_, page):
+        await page.goto(
+            "https://i.17zwd.com/user/favouriteShops",
+            wait_until="domcontentloaded",
+        )
+        if "/login" not in (page.url or ""):
+            print("已登录，无需重新登录。")
+            return 0
+        print("请在打开的浏览器中完成 17zwd 登录（扫码 / 账号密码）。")
+        for _ in range(settings.login_wait_seconds):
+            await page.wait_for_timeout(1_000)
+            if "/login" not in (page.url or ""):
+                break
+        else:
+            print(f"登录等待超时（{settings.login_wait_seconds} 秒），未检测到登录成功，请重试。")
+            return 1
+        print("登录成功，登录态已保存到本地浏览器配置。")
+        return 0
 
 
 async def scan_records(args: argparse.Namespace, settings: Settings) -> int:
@@ -159,9 +199,7 @@ async def scan_records(args: argparse.Namespace, settings: Settings) -> int:
     async with BrowserSession(settings).open() as (_, page):
         upload_records = UploadRecordsPage(page, settings.login_wait_seconds)
         await upload_records.open()
-        if await upload_records.is_login_page():
-            print("请在打开的浏览器中完成 17zwd 登录。")
-        await upload_records.wait_until_authenticated()
+        await _ensure_authenticated(upload_records, settings)
         await upload_records.select_platform(platform)
 
         products = []
@@ -568,9 +606,7 @@ async def list_from_shops(args: argparse.Namespace, settings: Settings) -> int:
     async with BrowserSession(settings).open() as (_, page):
         shops_page = FavoriteShopsPage(page, settings.login_wait_seconds)
         await shops_page.open()
-        if await shops_page.is_login_page():
-            print("请在打开的浏览器中完成 17zwd 登录。")
-        await shops_page.wait_until_authenticated()
+        await _ensure_authenticated(shops_page, settings)
 
         arrivals = await shops_page.collect_new_arrivals(args.pages)
         return await _process_arrivals(
@@ -599,9 +635,7 @@ async def reconcile_shop(args: argparse.Namespace, settings: Settings) -> int:
 
         upload_records = UploadRecordsPage(page, settings.login_wait_seconds)
         await upload_records.open()
-        if await upload_records.is_login_page():
-            print("请在打开的浏览器中完成 17zwd 登录。")
-        await upload_records.wait_until_authenticated()
+        await _ensure_authenticated(upload_records, settings)
         await upload_records.select_platform(platform)
         listed_products: list[SourceProduct] = []
         for page_index in range(max(1, args.record_pages)):
@@ -711,6 +745,15 @@ async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _run(coro):
+    """在菜单里运行一个任务，出错时打印原因并继续留在菜单，不让整程序崩溃。"""
+    try:
+        return asyncio.run(coro)
+    except Exception as exc:
+        print(f"\n[失败] {exc}\n")
+        return None
+
+
 def run_menu(settings: Settings) -> int:
     """交互式菜单，供「一键启动」双击调用。"""
     shops = {
@@ -729,11 +772,13 @@ def run_menu(settings: Settings) -> int:
                 f"请输入 {display} 目标店铺名（超级店长弹窗里的精确名字，可回车跳过）："
             ).strip()
         shop = shops[platform]
+        mode = "后台（不弹浏览器）" if settings.headless else "前台（可见浏览器）"
         print()
         print("=" * 42)
         print("  17zwd 铺货助手（一键启动）")
         print("=" * 42)
         print(f"  平台：{display}    目标店铺：{shop}")
+        print(f"  运行模式：{mode}")
         print(f"  每款停顿：{delay} 秒起（随机 {delay}~{delay * 2:.0f} 秒）")
         print("-" * 42)
         print("  1. 看货（扫描关注档口，不上架）")
@@ -755,10 +800,10 @@ def run_menu(settings: Settings) -> int:
                 platform=platform, pages=1, item_ids="", limit=0,
                 target_shop="", confirm_publish="", hold_open_seconds=0,
             )
-            asyncio.run(list_from_shops(args, settings))
+            _run(list_from_shops(args, settings))
         elif choice == "2":
             args = argparse.Namespace(platform=platform, pages=1, login_wait_seconds=None)
-            asyncio.run(scan_records(args, settings))
+            _run(scan_records(args, settings))
         elif choice == "3":
             value = input("要上架最新几款？").strip()
             if not value.isdigit():
@@ -768,14 +813,14 @@ def run_menu(settings: Settings) -> int:
                 platform=platform, pages=1, item_ids="", limit=int(value),
                 target_shop=shop, confirm_publish="PUBLISH", delay_seconds=delay, hold_open_seconds=0,
             )
-            asyncio.run(list_from_shops(args, settings))
+            _run(list_from_shops(args, settings))
         elif choice == "4":
             ids = input("要上架的商品 ID（逗号分隔）？").strip()
             args = argparse.Namespace(
                 platform=platform, pages=1, item_ids=ids, limit=0,
                 target_shop=shop, confirm_publish="PUBLISH", delay_seconds=delay, hold_open_seconds=0,
             )
-            asyncio.run(list_from_shops(args, settings))
+            _run(list_from_shops(args, settings))
         elif choice == "5":
             url = input("档口商品页链接（含 page=1&search=y）：").strip()
             start = input("从第几页开始？（默认 1）：").strip() or "1"
@@ -793,7 +838,7 @@ def run_menu(settings: Settings) -> int:
                 item_ids="", limit=0, pick=True, target_shop=shop, confirm_publish="PUBLISH",
                 delay_seconds=delay, hold_open_seconds=0,
             )
-            asyncio.run(list_from_shop(args, settings))
+            _run(list_from_shop(args, settings))
         elif choice == "6":
             url = input("档口商品页链接（含 page=1&search=y）：").strip()
             start = input("从第几页开始？（默认 1）：").strip() or "1"
@@ -809,7 +854,7 @@ def run_menu(settings: Settings) -> int:
             args = argparse.Namespace(
                 shop_url=url, platform=platform, pages=page_count, start_page=start_page, record_pages=20,
             )
-            asyncio.run(reconcile_shop(args, settings))
+            _run(reconcile_shop(args, settings))
         elif choice == "7":
             print("退出。")
             return 0
@@ -827,6 +872,8 @@ def main() -> int:
         initialize(settings.database_path)
         print(f"数据库已初始化：{settings.database_path}")
         return 0
+    if args.command == "login":
+        return asyncio.run(login(settings))
     if args.command == "scan-records":
         return asyncio.run(scan_records(args, settings))
     if args.command == "prepare-upload":

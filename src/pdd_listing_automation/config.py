@@ -6,6 +6,25 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 
+def _load_dotenv(directory: Path) -> None:
+    """极简 .env 加载（不依赖 python-dotenv）：只读 KEY=VALUE 行，不覆盖已存在的环境变量。
+
+    .env 被 .gitignore 忽略，适合放 headless、店铺名等本地配置，一次写好后续都生效。
+    """
+    env_path = directory / ".env"
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -20,7 +39,9 @@ class Settings(BaseModel):
 
     @classmethod
     def from_environment(cls) -> Settings:
-        root_dir = Path(os.getenv("PDD_AUTOMATION_HOME", Path.cwd())).resolve()
+        cwd = Path.cwd()
+        _load_dotenv(cwd)
+        root_dir = Path(os.getenv("PDD_AUTOMATION_HOME", cwd)).resolve()
         data_dir = root_dir / "data"
         artifacts_dir = root_dir / "artifacts"
         return cls(
