@@ -190,6 +190,27 @@
 - 其它参数（`--item-ids` / `--limit` / `--target-shop` / `--confirm-publish`）与 `list-from-shops` 一致。
 - 单件老品也可用 `prepare-upload --item-id "https://market.example.com/item/xxxxx"` 直接贴链接上架。
 
+## 上架清单与对账（Excel）
+
+上完品后想知道「我上的分别是哪家的」，用下面两种 Excel：
+
+1. **每次上架结束自动生成**：`artifacts/<本次>-上架结果.xlsx`，每款一行，含
+   商品 ID、标题、**档口**、档口主营、货号、货源价、状态（成功/跳过/失败）、失败原因、处理时间。
+2. **全局铺货清单**：菜单第 8 项「导出上架清单」，或命令行：
+
+   ```powershell
+   .\.venv\Scripts\python -m pdd_listing_automation.app export-report
+   ```
+
+   导出 `artifacts/上架清单-*.xlsx`，含「上架清单」和「按档口汇总」两个 sheet。
+
+说明：
+
+- 档口名在**上架时**从档口页面抓取并记录，最准；`list-from-shops`（关注档口）和
+  `list-from-shop`（档口老品）都会带上档口名。
+- 全局清单来自 17zwd 铺货记录；部分记录 17zwd 不显示「货源档口」，那一列可能为空，
+  所以优先用「上架结果 Excel」对账。
+
 ## Documents
 
 - [自动化技术设计](docs/automation-design.md)

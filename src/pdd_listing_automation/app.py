@@ -20,7 +20,7 @@ from pdd_listing_automation.pages.product_detail import ProductDetailPage
 from pdd_listing_automation.pages.shop_catalog import ShopCatalogPage
 from pdd_listing_automation.pages.upload_platform import AlreadyListedError, UploadPlatformPage
 from pdd_listing_automation.pages.upload_records import UploadRecordsPage
-from pdd_listing_automation.reports.exporter import export_models
+from pdd_listing_automation.reports.exporter import export_models, export_workbook_xlsx
 from pdd_listing_automation.services.discovery import DiscoveryService
 from pdd_listing_automation.storage.database import connect, initialize
 from pdd_listing_automation.storage.repositories import SourceProductRepository
@@ -153,6 +153,17 @@ def build_parser() -> argparse.ArgumentParser:
         "login",
         help="单独打开浏览器登录 17zwd（强制有头模式，登录态持久化）",
     )
+
+    report = subparsers.add_parser(
+        "export-report",
+        help="把铺货记录导出成 Excel（含档口/货号/价格/上架时间）",
+    )
+    report.add_argument(
+        "--platform",
+        choices=["pinduoduo", "douyin", "拼多多", "抖音", "all"],
+        default="all",
+        help="只导出某个平台，默认 all（全部）",
+    )
     return parser
 
 
@@ -189,6 +200,62 @@ async def login(settings: Settings) -> int:
             return 1
         print("登录成功，登录态已保存到本地浏览器配置。")
         return 0
+
+
+def export_report(settings: Settings, platform: Platform | None = None) -> int:
+    """把数据库里的铺货记录导出成 Excel（明细 + 按档口汇总），用于对账「我上的分别是哪家的」。"""
+    initialize(settings.database_path)
+    with connect(settings.database_path) as connection:
+        query = (
+            "SELECT source_goods_id, title, source_sku, price_text, source_shop, "
+            "source_category, source_platform, uploaded_at_text "
+            "FROM source_products"
+        )
+        params: tuple = ()
+        if platform is not None:
+            query += " WHERE source_platform = ?"
+            params = (platform.value,)
+        query += " ORDER BY source_platform, source_shop, uploaded_at_text DESC"
+        rows = connection.execute(query, params).fetchall()
+
+    if not rows:
+        print("暂无铺货记录。请先运行菜单「刷新铺货记录」（或 scan-records）再导出。")
+        return 0
+
+    detail = [
+        {
+            "商品ID": r["source_goods_id"],
+            "标题": r["title"],
+            "档口": r["source_shop"],
+            "货号": r["source_sku"],
+            "货源价": r["price_text"],
+            "类目": r["source_category"],
+            "平台": Platform(r["source_platform"]).display_name,
+            "上架时间": r["uploaded_at_text"],
+        }
+        for r in rows
+    ]
+
+    by_shop: dict[tuple[str, str], int] = {}
+    for r in rows:
+        key = (r["source_shop"], r["source_platform"])
+        by_shop[key] = by_shop.get(key, 0) + 1
+    summary = [
+        {"档口": shop, "平台": Platform(plat).display_name, "上架款数": cnt}
+        for (shop, plat), cnt in sorted(by_shop.items(), key=lambda kv: (-kv[1], kv[0][0]))
+    ]
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    stem = f"上架清单-{platform.value if platform else 'all'}-{timestamp}"
+    path = export_workbook_xlsx(
+        [("上架清单", detail), ("按档口汇总", summary)],
+        settings.artifacts_dir,
+        stem,
+    )
+
+    print(f"共 {len(detail)} 条铺货记录，来自 {len(summary)} 个档口。")
+    print(f"Excel：{path}")
+    return 0
 
 
 async def scan_records(args: argparse.Namespace, settings: Settings) -> int:
@@ -525,6 +592,7 @@ async def _process_arrivals(
     failures: list[str] = []
     consecutive_failures = 0
     delay_seconds = float(getattr(args, "delay_seconds", 15.0))
+    report_rows: list[dict[str, str]] = []
     for index, arrival in enumerate(selected, 1):
         name = arrival.title or arrival.shop_name or arrival.item_id
         print(f"[{index}/{len(selected)}] id={arrival.item_id}（{name}）")
@@ -570,14 +638,47 @@ async def _process_arrivals(
             print(f"  货号：{result['sku']}  货源价：¥{result['price']}")
             print("  状态：已提交上架任务。" if published else "  状态：已到“选择上货店铺”，尚未开始上传。")
             print(f"  截图：{result['screenshot_path']}")
+            report_rows.append({
+                "商品ID": arrival.item_id,
+                "标题": result["title"],
+                "档口": arrival.shop_name,
+                "档口主营": arrival.shop_main_category,
+                "货号": result["sku"],
+                "货源价": result["price"],
+                "状态": "成功",
+                "失败原因": "",
+                "处理时间": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
+            })
         elif skip:
             consecutive_failures = 0
             skipped.append(arrival.item_id)
             print("  ⏭ 跳过（已上架）")
+            report_rows.append({
+                "商品ID": arrival.item_id,
+                "标题": arrival.title,
+                "档口": arrival.shop_name,
+                "档口主营": arrival.shop_main_category,
+                "货号": "",
+                "货源价": arrival.price_text,
+                "状态": "跳过(已上架)",
+                "失败原因": "",
+                "处理时间": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
+            })
         else:
             failures.append(arrival.item_id)
             consecutive_failures += 1
             print(f"  ❌ 失败：{type(error).__name__}: {error}")
+            report_rows.append({
+                "商品ID": arrival.item_id,
+                "标题": arrival.title,
+                "档口": arrival.shop_name,
+                "档口主营": arrival.shop_main_category,
+                "货号": "",
+                "货源价": arrival.price_text,
+                "状态": "失败",
+                "失败原因": str(error),
+                "处理时间": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
+            })
             if "closed" in str(error).lower() or "TargetClosed" in type(error).__name__:
                 print("  （浏览器已关闭，停止后续上架）")
                 break
@@ -597,6 +698,14 @@ async def _process_arrivals(
                     print("  （浏览器已关闭，停止后续上架）")
                     break
                 raise
+
+    if report_rows:
+        report_path = export_workbook_xlsx(
+            [("上架结果", report_rows)],
+            settings.artifacts_dir,
+            f"{stem}-上架结果",
+        )
+        print(f"上架结果 Excel：{report_path}")
 
     summary = f"完成：成功 {successes} 款"
     if skipped:
@@ -797,11 +906,12 @@ def run_menu(settings: Settings) -> int:
         print("  4. 上架指定商品 ID（真实发布）")
         print("  5. 上架档口老品（贴档口商品页链接）")
         print("  6. 校对档口（已上架/漏上）")
+        print("  8. 导出上架清单（Excel，含档口）")
         print("  0. 切换平台（拼多多/抖音）")
         print("  7. 退出")
         print("=" * 42)
 
-        choice = input("请选择 (0-7)：").strip()
+        choice = input("请选择 (0-8)：").strip()
         if choice == "0":
             platform = "douyin" if platform == "pinduoduo" else "pinduoduo"
             continue
@@ -874,6 +984,11 @@ def run_menu(settings: Settings) -> int:
                 shop_url=url, platform=platform, pages=page_count, start_page=start_page, record_pages=20,
             )
             _run(reconcile_shop(args, settings))
+        elif choice == "8":
+            try:
+                export_report(settings, Platform.parse(platform))
+            except Exception as exc:
+                print(f"\n[失败] {exc}\n")
         elif choice == "7":
             print("退出。")
             return 0
@@ -893,6 +1008,9 @@ def main() -> int:
         return 0
     if args.command == "login":
         return asyncio.run(login(settings))
+    if args.command == "export-report":
+        platform = None if args.platform == "all" else Platform.parse(args.platform)
+        return export_report(settings, platform)
     if args.command == "scan-records":
         return asyncio.run(scan_records(args, settings))
     if args.command == "prepare-upload":

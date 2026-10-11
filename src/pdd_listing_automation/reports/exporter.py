@@ -35,3 +35,41 @@ def export_models(
             writer.writerows(rows)
 
     return json_path, csv_path
+
+
+def export_workbook_xlsx(
+    sheets: list[tuple[str, list[dict[str, Any]]]],
+    output_dir: Path,
+    stem: str,
+) -> Path:
+    """把多个 sheet 写成一个真正的 .xlsx（依赖 openpyxl，已列为项目依赖）。
+
+    - 表头加粗；列宽按内容长度粗估，方便直接打开看。
+    - sheet 名最长 31 字符（Excel 限制），超出自动截断。
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{stem}.xlsx"
+
+    wb = Workbook()
+    wb.remove(wb.active)  # 去掉默认空表，只保留我们创建的
+
+    for sheet_name, rows in sheets:
+        ws = wb.create_sheet(title=sheet_name[:31])
+        if not rows:
+            continue
+        fieldnames = list(rows[0].keys())
+        ws.append(fieldnames)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for row in rows:
+            ws.append([row.get(k, "") for k in fieldnames])
+        for idx, key in enumerate(fieldnames, 1):
+            width = max(len(str(key)), *(len(str(r.get(key, ""))) for r in rows[:500]))
+            ws.column_dimensions[get_column_letter(idx)].width = min(max(width + 2, 8), 50)
+
+    wb.save(path)
+    return path

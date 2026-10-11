@@ -25,6 +25,25 @@ _EXTRACT_ITEMS_JS = """
 })
 """
 
+# 从档口商品页顶部抓档口名：优先常见选择器，兜底用页面标题（去掉站点后缀）。
+_EXTRACT_SHOP_NAME_JS = """
+() => {
+  const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  for (const sel of [
+    '.shop-name', '.shopName', '.shop-name-box', '.seller-name', '.sellerName',
+    '.shop-info .name', '.shop-info .shop-name', '.shopHeader .name',
+    '.shop-title', '.shop-info h1', 'h1',
+  ]) {
+    const el = document.querySelector(sel);
+    const t = clean(el && el.textContent);
+    if (t && t.length <= 40) return t;
+  }
+  let title = clean(document.title);
+  title = title.replace(/[-_|·]?\\s*(17zwd|17\\u7f51|十七\\u7f51|批发|货源).*$/i, '').trim();
+  return title;
+}
+"""
+
 
 def _normalize_shop_url(url: str) -> str:
     """把任意档口链接规范成「在售商品」分页 URL：/shop/{id}.htm?page=1&search=y。
@@ -44,18 +63,23 @@ class ShopCatalogPage:
     def __init__(self, page: Page) -> None:
         self.page = page
         self.base_url = ""
+        self.shop_name = ""
 
     async def open(self, url: str, start_page: int = 1) -> None:
         self.base_url = _normalize_shop_url(url)  # 始终从 page=1 开始
         await self.page.goto(self.base_url, wait_until="domcontentloaded")
         await self.page.locator("a[href*='/item/']").first.wait_for(timeout=20_000)
+        self.shop_name = await self.page.evaluate(_EXTRACT_SHOP_NAME_JS)
         # 从第 1 页用「下一页」按钮逐页前进到起始页（URL 直接跳转会漏加载）
         for _ in range(max(0, start_page - 1)):
             await self.go_to_next_page()
 
     async def collect_current_page(self) -> list[ShopNewArrival]:
         raw = await self.page.evaluate(_EXTRACT_ITEMS_JS)
-        return [ShopNewArrival.model_validate(item) for item in raw]
+        arrivals = [ShopNewArrival.model_validate(item) for item in raw]
+        for arrival in arrivals:
+            arrival.shop_name = self.shop_name
+        return arrivals
 
     async def go_to_next_page(self) -> None:
         """点分页「下一页」按钮翻页（URL 直接跳转会漏加载，点按钮才完整渲染）。"""
