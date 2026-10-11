@@ -509,6 +509,16 @@ async def _process_arrivals(
         print("没有可上架的商品（可能都已上过，或未选择）。")
         return 0
 
+    # 发布前一次性校验，避免批量循环里每款都报同一个错、白跑几百次
+    if args.confirm_publish:
+        if args.confirm_publish != "PUBLISH":
+            raise RuntimeError("发布确认短语不正确，必须为 PUBLISH")
+        if not args.target_shop:
+            raise RuntimeError(
+                "执行发布必须指定目标店铺名（--target-shop）。"
+                "菜单里请先填写店铺名；命令行请加 --target-shop \"你的店铺名\"。"
+            )
+
     print(f"本次将处理 {len(selected)} 款。")
     successes = 0
     skipped: list[str] = []
@@ -805,6 +815,9 @@ def run_menu(settings: Settings) -> int:
             args = argparse.Namespace(platform=platform, pages=1, login_wait_seconds=None)
             _run(scan_records(args, settings))
         elif choice == "3":
+            if not shop:
+                print("发布上架需要先填写目标店铺名（不能跳过）。")
+                continue
             value = input("要上架最新几款？").strip()
             if not value.isdigit():
                 print("请输入数字。")
@@ -815,6 +828,9 @@ def run_menu(settings: Settings) -> int:
             )
             _run(list_from_shops(args, settings))
         elif choice == "4":
+            if not shop:
+                print("发布上架需要先填写目标店铺名（不能跳过）。")
+                continue
             ids = input("要上架的商品 ID（逗号分隔）？").strip()
             args = argparse.Namespace(
                 platform=platform, pages=1, item_ids=ids, limit=0,
@@ -822,6 +838,9 @@ def run_menu(settings: Settings) -> int:
             )
             _run(list_from_shops(args, settings))
         elif choice == "5":
+            if not shop:
+                print("发布上架需要先填写目标店铺名（不能跳过）。")
+                continue
             url = input("档口商品页链接（含 page=1&search=y）：").strip()
             start = input("从第几页开始？（默认 1）：").strip() or "1"
             pages = input("扫描几页？（默认 1）：").strip() or "1"
