@@ -5,6 +5,8 @@ from contextlib import suppress
 
 from playwright.async_api import Locator, Page
 
+from pdd_listing_automation.models import ListingStatus
+
 
 def _is_closed_error(exc: Exception) -> bool:
     """判断异常是否是「页面/上下文/浏览器被关闭」导致的。"""
@@ -18,6 +20,8 @@ class AlreadyListedError(RuntimeError):
 class UploadPlatformPage:
     def __init__(self, page: Page) -> None:
         self.page = page
+        self.last_submission_detail = "尚未点击确认上货"
+        self.last_visible_text = ""
 
     def store_dialog(self):
         return self.page.frame_locator("iframe").get_by_role(
@@ -27,6 +31,7 @@ class UploadPlatformPage:
 
     async def _grab_context_text(self, limit: int = 300) -> str:
         """失败时尽力抓一段可见文字，用于定位真实原因（授权过期/上限/风控提示）。"""
+        parts: list[str] = []
         for locator in (
             self.page.frame_locator("iframe").first.locator("body"),
             self.page.locator("body"),
@@ -35,7 +40,18 @@ class UploadPlatformPage:
                 text = await locator.inner_text(timeout=2_000)
                 flat = " ".join(text.split())
                 if flat:
-                    return flat[:limit]
+                    parts.append(flat[: max(1, limit // 2)])
+        return " | ".join(parts)[:limit]
+
+    async def _visible_success_text(self) -> str:
+        """直接查找可见反馈，避免长规格表把页尾或外层通知挤出文本截断范围。"""
+        pattern = re.compile(r"^(?:提交成功|任务创建成功|上传成功|上货成功)(?:$|[\s！!。，,:：])")
+        for root in (self.page.frame_locator("iframe").first, self.page):
+            candidates = root.get_by_text(pattern)
+            for index in range(await candidates.count()):
+                candidate = candidates.nth(index)
+                if await candidate.is_visible():
+                    return await candidate.inner_text(timeout=1_000)
         return ""
 
     async def confirm_superboss(self) -> None:
@@ -95,13 +111,16 @@ class UploadPlatformPage:
     async def _find_shop_row(self, dialog: Locator, shop_name: str, exact: bool) -> Locator | None:
         """在选店弹窗里找含 shop_name 且带复选框的店铺行；找不到返回 None。"""
         candidates = dialog.get_by_text(shop_name, exact=exact)
+        matches: list[Locator] = []
         for index in range(await candidates.count()):
             ancestor = candidates.nth(index).locator(
                 "xpath=ancestor::*[.//input[@type='checkbox']][1]"
             )
             if await ancestor.count() == 1:
-                return ancestor
-        return None
+                matches.append(ancestor)
+        if len(matches) > 1:
+            raise RuntimeError(f"店铺名称匹配到多条记录：{shop_name}，请使用完整名称")
+        return matches[0] if matches else None
 
     async def accept_commitment(self) -> None:
         """签署「商家搬家承诺书」。若当前平台/店铺没有该承诺书（如抖音）则跳过。"""
@@ -132,12 +151,12 @@ class UploadPlatformPage:
         with suppress(Exception):
             await self.page.wait_for_timeout(5_000)
 
-    async def confirm_listing(self) -> None:
+    async def confirm_listing(self) -> ListingStatus:
         """点「确认上货」提交任务。
 
         start_upload 已经等了类目自动匹配的时间；这里等「确认上货」出现并点击。
         点「确认上货」之前标签页被关 = 上货未完成（失败）；
-        点「确认上货」之后标签页被关 = 超级店长提交后关页（成功）。
+        点击后必须看到明确提交提示；关页或没有结果均返回待核实，不冒充上架成功。
         """
         frame = self.page.frame_locator("iframe").first
         confirm = frame.get_by_role("button", name="确认上货")
@@ -145,7 +164,7 @@ class UploadPlatformPage:
         for _ in range(60):
             # 已存在代销关系：弹「重复铺货确认」，点取消跳过（弹窗可能稍后才出现，所以每轮都查）
             try:
-                duplicate = await frame.get_by_text("重复铺货确认", exact=False).count()
+                duplicate = await frame.get_by_text("重复铺货确认", exact=False).first.is_visible()
             except Exception as exc:
                 if _is_closed_error(exc):
                     raise RuntimeError("等待确认上货时页面被关闭，上货未完成")
@@ -158,12 +177,18 @@ class UploadPlatformPage:
                         with suppress(Exception):
                             await self.page.wait_for_timeout(1_000)
                         break
-                raise AlreadyListedError("该商品已存在代销关系（已铺过）")
+                raise AlreadyListedError("上传页面显示可见的「重复铺货确认」，已取消本次操作")
 
             # 点「确认上货」提交任务
             try:
                 if await confirm.count() == 1:
-                    await confirm.click()
+                    try:
+                        await confirm.click()
+                    except Exception:  # noqa: BLE001 — 提交阶段任何异常均不能盲目重发
+                        # 点击过程中断开连接，无法确认是否已发送，禁止直接重试。
+                        self.last_submission_detail = "点击确认上货时出现异常，无法确认是否已发送"
+                        return ListingStatus.UNCERTAIN
+                    self.last_submission_detail = "已点击确认上货，正在等待页面反馈"
                     break
             except Exception as exc:
                 if _is_closed_error(exc):
@@ -181,24 +206,35 @@ class UploadPlatformPage:
                 f"确认上货按钮定位失败；页面文字：{await self._grab_context_text()}"
             )
 
-        # 点完「确认上货」后：标签页关闭 = 提交成功；短等检查明显报错
+        # 点完后检查错误和明确提交提示；仅有页面关闭无法证明已成功。
         error_keywords = (
             "重复铺货确认", "授权已过期", "授权过期", "已过期", "已达上限",
             "达到上限", "操作频繁", "无权限",
         )
-        for _ in range(10):  # 最多 5 秒
+        for _ in range(60):  # 最多 30 秒；超级店长异步提交可能超过 5 秒
             try:
-                text = await self._grab_context_text(limit=500)
-            except Exception as exc:
-                if _is_closed_error(exc):
-                    return  # 提交成功后超级店长关页
-                raise
+                success_text = await self._visible_success_text()
+                if success_text:
+                    self.last_visible_text = success_text
+                    self.last_submission_detail = f"页面反馈：{success_text}；仍需核验目标平台是否上架"
+                    return ListingStatus.SUBMITTED
+                text = await self._grab_context_text(limit=20_000)
+                self.last_visible_text = text
+            except Exception as exc:  # noqa: BLE001 — 提交后的读取异常只能视为结果未知
+                self.last_submission_detail = f"读取提交反馈时异常：{type(exc).__name__}: {exc}"
+                return ListingStatus.UNCERTAIN
             for keyword in error_keywords:
                 if keyword in text:
                     raise RuntimeError(f"确认上货后出现异常（「{keyword}」）：{text[:200]}")
+            if any(keyword in text for keyword in ("提交成功", "任务创建成功", "上传成功", "上货成功")):
+                self.last_submission_detail = "页面显示明确提交成功提示，仍需核验目标平台是否上架"
+                return ListingStatus.SUBMITTED
             try:
                 await self.page.wait_for_timeout(500)
             except Exception as exc:
                 if _is_closed_error(exc):
-                    return
+                    self.last_submission_detail = "点击确认上货后页面关闭，未读取到明确结果；需核对上货日志"
+                    return ListingStatus.UNCERTAIN
                 raise
+        self.last_submission_detail = "点击确认上货后等待 30 秒，未检测到明确提交提示"
+        return ListingStatus.UNCERTAIN

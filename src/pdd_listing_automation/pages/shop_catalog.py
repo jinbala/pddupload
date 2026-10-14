@@ -91,11 +91,19 @@ class ShopCatalogPage:
         await pager_next.locator("button").click()
         await self.page.wait_for_timeout(1500)
 
+    async def has_next_page(self) -> bool:
+        pager_next = self.page.locator("li.ant-pagination-next")
+        if await pager_next.count() != 1:
+            raise RuntimeError("分页组件定位失败")
+        return not await pager_next.evaluate("el => el.classList.contains('ant-pagination-disabled')")
+
     async def collect(self, pages: int = 1) -> list[ShopNewArrival]:
         arrivals: list[ShopNewArrival] = []
         for page_index in range(max(1, pages)):
             arrivals.extend(await self.collect_current_page())
             if page_index + 1 >= max(1, pages):
+                break
+            if not await self.has_next_page():
                 break
             await self.go_to_next_page()
         return arrivals

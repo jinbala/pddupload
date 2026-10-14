@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -50,6 +51,12 @@ class TaskStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class ListingStatus(StrEnum):
+    RECORDED = "recorded"
+    SUBMITTED = "submitted"
+    UNCERTAIN = "uncertain"
+
+
 class SourceProduct(BaseModel):
     source_goods_id: str
     source_row_key: str
@@ -61,6 +68,8 @@ class SourceProduct(BaseModel):
     image_url: str = ""
     find_similar_url: str = ""
     source_platform: Platform
+    target_shop: str = ""
+    listing_status: ListingStatus = ListingStatus.RECORDED
     uploaded_at_text: str = ""
     collected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -75,6 +84,7 @@ class SourceProduct(BaseModel):
         "image_url",
         "find_similar_url",
         "uploaded_at_text",
+        "target_shop",
         mode="before",
     )
     @classmethod
@@ -84,6 +94,13 @@ class SourceProduct(BaseModel):
     @property
     def identity(self) -> str:
         return self.source_goods_id or self.source_row_key
+
+    @property
+    def storage_key(self) -> str:
+        return json.dumps(
+            [self.source_platform.value, self.target_shop, self.identity],
+            ensure_ascii=False, separators=(",", ":"),
+        )
 
 
 class PublishTask(BaseModel):

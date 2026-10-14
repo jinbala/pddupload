@@ -20,7 +20,7 @@ class DiscoveryService:
         self.products = SourceProductRepository(connection)
 
     def store(self, products: list[SourceProduct]) -> DiscoveryResult:
-        deduplicated = {product.identity: product for product in products}
+        deduplicated = {product.storage_key: product for product in products}
         self.products.upsert_many(deduplicated.values())
         return DiscoveryResult(
             collected=len(products),

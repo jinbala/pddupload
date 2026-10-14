@@ -1,9 +1,11 @@
 import argparse
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 from pdd_listing_automation.app import parse_item_ref, parse_selection, select_arrivals
 from pdd_listing_automation.models import ShopNewArrival
 from pdd_listing_automation.pages.favorite_shops import parse_shop_card
-from pdd_listing_automation.pages.shop_catalog import _normalize_shop_url
+from pdd_listing_automation.pages.shop_catalog import ShopCatalogPage, _normalize_shop_url
 
 
 def test_parse_shop_card_extracts_shop_and_items() -> None:
@@ -88,6 +90,14 @@ def test_select_arrivals_by_limit_skips_listed() -> None:
     assert [a.item_id for a in skipped] == ["1", "3"]
 
 
+def test_select_arrivals_deduplicates_repeated_ids():
+    selected, skipped = select_arrivals(
+        [_arrival("1"), _arrival("2")], argparse.Namespace(item_ids="1，1,2", limit=0), set(),
+    )
+    assert [arrival.item_id for arrival in selected] == ["1", "2"]
+    assert skipped == []
+
+
 def test_parse_item_ref_accepts_full_url() -> None:
     item_id, item_url = parse_item_ref("https://market.example.com/item/10001?")
     assert item_id == "10001"
@@ -116,3 +126,12 @@ def test_normalize_shop_url_adds_search_and_drops_spm() -> None:
     assert _normalize_shop_url("https://market.example.com/shop/20001.htm") == (
         "https://market.example.com/shop/20001.htm?page=1&search=y"
     )
+
+
+def test_shop_catalog_stops_at_last_page_without_losing_collected_items():
+    catalog = ShopCatalogPage(MagicMock())
+    catalog.collect_current_page = AsyncMock(return_value=[_arrival("1")])
+    catalog.has_next_page = AsyncMock(return_value=False)
+    catalog.go_to_next_page = AsyncMock()
+    assert [a.item_id for a in asyncio.run(catalog.collect(20))] == ["1"]
+    catalog.go_to_next_page.assert_not_awaited()

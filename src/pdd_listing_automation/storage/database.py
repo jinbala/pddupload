@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
+from time import time_ns
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_products (
@@ -16,6 +18,8 @@ CREATE TABLE IF NOT EXISTS source_products (
     image_url TEXT NOT NULL DEFAULT '',
     find_similar_url TEXT NOT NULL DEFAULT '',
     source_platform TEXT NOT NULL,
+    target_shop TEXT NOT NULL DEFAULT '',
+    listing_status TEXT NOT NULL DEFAULT 'recorded',
     uploaded_at_text TEXT NOT NULL DEFAULT '',
     collected_at TEXT NOT NULL
 );
@@ -68,3 +72,39 @@ def connect(database_path: Path) -> sqlite3.Connection:
 def initialize(database_path: Path) -> None:
     with connect(database_path) as connection:
         connection.executescript(SCHEMA)
+        if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+            # 迁移前备份旧库；历史记录的目标店铺未知，保持为空。
+            if connection.execute("SELECT COUNT(*) FROM source_products").fetchone()[0]:
+                backup_path = database_path.with_name(f"{database_path.name}.bak-{time_ns()}")
+                with sqlite3.connect(backup_path) as backup:
+                    connection.backup(backup)
+            with connection:
+                columns = {r["name"] for r in connection.execute("PRAGMA table_info(source_products)")}
+                if "target_shop" not in columns:
+                    connection.execute(
+                        "ALTER TABLE source_products ADD COLUMN target_shop TEXT NOT NULL DEFAULT ''"
+                    )
+                if "listing_status" not in columns:
+                    connection.execute(
+                        "ALTER TABLE source_products ADD COLUMN listing_status "
+                        "TEXT NOT NULL DEFAULT 'recorded'"
+                    )
+                rows = connection.execute(
+                    "SELECT identity_key, source_platform, target_shop, source_goods_id, "
+                    "source_row_key FROM source_products"
+                ).fetchall()
+                for row in rows:
+                    key = json.dumps(
+                        [row["source_platform"], row["target_shop"],
+                         row["source_goods_id"] or row["source_row_key"]],
+                        ensure_ascii=False, separators=(",", ":"),
+                    )
+                    connection.execute(
+                        "UPDATE source_products SET identity_key = ? WHERE identity_key = ?",
+                        (key, row["identity_key"]),
+                    )
+                connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_products_scope "
+            "ON source_products(source_platform, target_shop, source_goods_id)"
+        )
