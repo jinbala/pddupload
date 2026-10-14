@@ -9,7 +9,11 @@ from pdd_listing_automation import app
 from pdd_listing_automation.browser.session import profile_lock
 from pdd_listing_automation.config import Settings
 from pdd_listing_automation.models import ListingStatus, Platform, ShopNewArrival
-from pdd_listing_automation.pages.upload_platform import AlreadyListedError, UploadPlatformPage
+from pdd_listing_automation.pages.upload_platform import (
+    AlreadyListedError,
+    UploadPlatformPage,
+    UploadRejectedError,
+)
 from pdd_listing_automation.storage.database import connect
 
 
@@ -44,9 +48,10 @@ def test_batch_records_submission_states_and_continues_on_uncertain(settings, mo
     ))
     with connect(settings.database_path) as db:
         rows = db.execute("SELECT * FROM source_products").fetchall()
+    sheets = dict(exports)
     if status == "prepared":
         assert rows == []
-        assert exports[0][1][0]["状态"] == "准备完成（未发布）"
+        assert sheets["上架结果"][0]["状态"] == "准备完成（未发布）"
     else:
         assert len(rows) == 2
         assert rows[0]["source_shop"] == "来源档口"
@@ -56,9 +61,9 @@ def test_batch_records_submission_states_and_continues_on_uncertain(settings, mo
         assert rows[0]["listing_status"] == status
     assert code == (1 if status == "uncertain" else 0)
     assert upload.await_count == 2
-    assert len(exports[0][1]) == 2
+    assert len(sheets["上架结果"]) == 2
     if status == "uncertain":
-        assert all(row["状态"] == "提交结果待核实" for row in exports[0][1])
+        assert all(row["状态"] == "提交结果待核实" for row in sheets["上架结果"])
         assert "待核实商品 ID：1,2" in capsys.readouterr().out
 
 
@@ -99,7 +104,8 @@ def test_profile_lock_rejects_concurrent_task_and_releases(tmp_path):
         pass
 
 
-def test_interrupted_submission_is_persisted_before_click_and_blocks_retry(settings, monkeypatch):
+@pytest.mark.parametrize("rejected", [False, True])
+def test_interrupted_submission_blocks_retry_but_explicit_rejection_does_not(settings, monkeypatch, rejected):
     product = MagicMock()
     product.open = AsyncMock()
     product.collect_summary = AsyncMock(return_value={"title": "test", "sku": "ABC", "price": "20"})
@@ -111,7 +117,9 @@ def test_interrupted_submission_is_persisted_before_click_and_blocks_retry(setti
     for name in ("confirm_superboss", "wait_for_store_selection", "select_shop",
                  "accept_commitment", "start_upload"):
         setattr(platform, name, AsyncMock())
-    platform.confirm_listing = AsyncMock(side_effect=RuntimeError("interrupted"))
+    platform.confirm_listing = AsyncMock(side_effect=(
+        UploadRejectedError("授权已过期") if rejected else RuntimeError("interrupted")
+    ))
     monkeypatch.setattr(app, "UploadPlatformPage", lambda page: platform)
     arrival = ShopNewArrival(item_id="1", item_url="https://market.example.com/item/1", shop_name="档口")
     kwargs = {
@@ -119,6 +127,12 @@ def test_interrupted_submission_is_persisted_before_click_and_blocks_retry(setti
         "target_shop": "目标店", "confirm_publish": "PUBLISH", "screenshot_stem": "test",
         "settings": settings, "source_arrival": arrival,
     }
+    if rejected:
+        with pytest.raises(UploadRejectedError):
+            asyncio.run(app.run_single_upload(MagicMock(), **kwargs))
+        with connect(settings.database_path) as db:
+            assert db.execute("SELECT COUNT(*) FROM source_products").fetchone()[0] == 0
+        return
     result, _, attempted = asyncio.run(app.run_single_upload(MagicMock(), **kwargs))
     assert attempted
     assert result["listing_status"] == ListingStatus.UNCERTAIN

@@ -8,6 +8,7 @@ import os
 import random
 import re
 import traceback
+from collections import Counter
 from contextlib import suppress
 from datetime import UTC, datetime
 
@@ -20,7 +21,11 @@ from pdd_listing_automation.pages.favorite_shops import FavoriteShopsPage
 from pdd_listing_automation.pages.pdd_draft import PddDraftPage
 from pdd_listing_automation.pages.product_detail import ProductDetailPage
 from pdd_listing_automation.pages.shop_catalog import ShopCatalogPage
-from pdd_listing_automation.pages.upload_platform import AlreadyListedError, UploadPlatformPage
+from pdd_listing_automation.pages.upload_platform import (
+    AlreadyListedError,
+    UploadPlatformPage,
+    UploadRejectedError,
+)
 from pdd_listing_automation.pages.upload_records import UploadRecordsPage
 from pdd_listing_automation.reports.exporter import export_models, export_workbook_xlsx
 from pdd_listing_automation.services.discovery import DiscoveryService
@@ -32,6 +37,53 @@ LISTING_LABELS = {
     ListingStatus.SUBMITTED: "已提交（待核验上架）",
     ListingStatus.UNCERTAIN: "提交结果待核实",
 }
+
+
+def build_batch_summary(rows: list[dict[str, str]], total: int) -> dict[str, int]:
+    statuses = Counter(row["状态"] for row in rows)
+    return {
+        "本次选择": total,
+        "已处理": len(rows),
+        "提交成功": statuses[LISTING_LABELS[ListingStatus.SUBMITTED]],
+        "失败": statuses["失败"],
+        "跳过": statuses["跳过（已有记录）"],
+        "待核实": statuses[LISTING_LABELS[ListingStatus.UNCERTAIN]],
+        "准备完成（未发布）": statuses["准备完成（未发布）"],
+        "未处理": max(0, total - len(rows)),
+    }
+
+
+def format_batch_summary(
+    rows: list[dict[str, str]], total: int, platform: Platform, target_shop: str,
+    stop_reason: str = "",
+) -> str:
+    counts = build_batch_summary(rows, total)
+    lines = [
+        "=" * 48,
+        "本次铺货总结",
+        f"平台：{platform.display_name}  目标店铺：{target_shop or '未指定'}",
+        f"本次选择 {total} 款，已处理 {counts['已处理']} 款，未处理 {counts['未处理']} 款",
+        (f"提交成功 {counts['提交成功']} 款 | 失败 {counts['失败']} 款 | "
+         f"跳过 {counts['跳过']} 款 | 待核实 {counts['待核实']} 款"),
+    ]
+    if counts["准备完成（未发布）"]:
+        lines.append(f"仅准备、未发布：{counts['准备完成（未发布）']} 款")
+    lines.append("平台最终上架状态尚未核验；上述成功数量指提交成功。")
+    for status, label in (("失败", "失败"), (LISTING_LABELS[ListingStatus.UNCERTAIN], "待核实")):
+        matches = [row for row in rows if row["状态"] == status]
+        if not matches:
+            continue
+        lines.append(f"{label}商品 ID：{','.join(row['商品ID'] for row in matches)}")
+        reasons = Counter(
+            " ".join(row.get("失败原因", "").split()) or "未获得明确结果，详见提交诊断"
+            for row in matches
+        )
+        for reason, count in reasons.items():
+            lines.append(f"  {count} 款：{reason[:200]}")
+    if stop_reason:
+        lines.append(f"提前结束原因：{stop_reason}")
+    lines.append("=" * 48)
+    return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -466,6 +518,13 @@ async def run_single_upload(
         except AlreadyListedError:
             _mark_listed(settings, arrival, platform, target_shop, summary, ListingStatus.RECORDED)
             raise
+        except UploadRejectedError:
+            # 明确拒绝提交的商品按失败统计；解除本次预写的待核实拦截。
+            with connect(settings.database_path) as connection:
+                SourceProductRepository(connection).resolve_submission(
+                    platform, target_shop, item_id, recorded=False,
+                )
+            raise
         except Exception as exc:  # noqa: BLE001 — 进入提交阶段后出错必须保留待核实状态
             submission_detail = f"提交阶段异常：{type(exc).__name__}: {exc}"
             await _record_failure_evidence(page, settings, item_id, exc)
@@ -701,13 +760,8 @@ async def _process_arrivals(
             )
 
     print(f"本次将处理 {len(selected)} 款。")
-    prepared_count = 0
-    submitted_count = 0
-    uncertain_count = 0
-    uncertain_ids: list[str] = []
-    skipped: list[str] = []
-    failures: list[str] = []
     consecutive_failures = 0
+    stop_reason = ""
     delay_seconds = float(getattr(args, "delay_seconds", 15.0))
     report_rows: list[dict[str, str]] = []
     for index, arrival in enumerate(selected, 1):
@@ -757,13 +811,8 @@ async def _process_arrivals(
             if published:
                 status = ListingStatus(result["listing_status"])
                 _mark_listed(settings, arrival, platform, args.target_shop, result, status)
-                submitted_count += status == ListingStatus.SUBMITTED
-                uncertain_count += status == ListingStatus.UNCERTAIN
-                if status == ListingStatus.UNCERTAIN:
-                    uncertain_ids.append(arrival.item_id)
                 status_label = LISTING_LABELS[status]
             else:
-                prepared_count += 1
                 status_label = "准备完成（未发布）"
             print(f"  商品：{result['title']}")
             print(f"  货号：{result['sku']}  货源价：¥{result['price']}")
@@ -789,7 +838,6 @@ async def _process_arrivals(
                 print("  已保留待核实记录，不重发本款，继续处理下一款。")
         elif skip:
             consecutive_failures = 0
-            skipped.append(arrival.item_id)
             print(f"  ⏭ 跳过：{error}")
             report_rows.append({
                 "商品ID": arrival.item_id,
@@ -804,7 +852,6 @@ async def _process_arrivals(
                 "处理时间": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
             })
         else:
-            failures.append(arrival.item_id)
             consecutive_failures += 1
             print(f"  ❌ 失败：{type(error).__name__}: {error}")
             report_rows.append({
@@ -820,9 +867,11 @@ async def _process_arrivals(
                 "处理时间": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
             })
             if "closed" in str(error).lower() or "TargetClosed" in type(error).__name__:
+                stop_reason = "浏览器已关闭"
                 print("  （浏览器已关闭，停止后续上架）")
                 break
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                stop_reason = f"连续失败 {consecutive_failures} 次"
                 print(
                     f"  （连续失败 {consecutive_failures} 次，自动暂停上架，"
                     "先排查原因再继续，详见 artifacts/failures.log）"
@@ -835,34 +884,54 @@ async def _process_arrivals(
                 await page.wait_for_timeout(delay_seconds * random.uniform(1.0, 2.0) * 1000)
             except Exception as exc:
                 if "closed" in str(exc).lower() or "TargetClosed" in type(exc).__name__:
+                    stop_reason = "浏览器在款间等待时关闭"
                     print("  （浏览器已关闭，停止后续上架）")
                     break
                 raise
 
-    if report_rows:
-        report_path = export_workbook_xlsx(
-            [("上架结果", report_rows)],
-            settings.artifacts_dir,
-            f"{stem}-上架结果",
-        )
-        print(f"上架结果 Excel：{report_path}")
-
-    summary = (
-        f"完成：准备 {prepared_count} 款，已提交 {submitted_count} 款，"
-        f"结果待核实 {uncertain_count} 款"
-    )
-    if skipped:
-        summary += f"，跳过 {len(skipped)} 款（已有记录）"
-    if failures:
-        summary += f"，失败 {len(failures)} 款（失败 ID：{failures}）"
+    counts = build_batch_summary(report_rows, len(selected))
+    summary = format_batch_summary(report_rows, len(selected), platform, args.target_shop, stop_reason)
+    summary_rows = [
+        {"项目": "平台", "结果": platform.display_name},
+        {"项目": "目标店铺", "结果": args.target_shop or "未指定"},
+        *({"项目": key, "结果": value} for key, value in counts.items()),
+        {"项目": "成功口径", "结果": "提交成功，尚未核验平台最终上架结果"},
+        {"项目": "提前结束原因", "结果": stop_reason or "无"},
+    ]
+    failed_rows = [row for row in report_rows if row["状态"] == "失败"]
+    uncertain_rows = [row for row in report_rows if row["状态"] == LISTING_LABELS[ListingStatus.UNCERTAIN]]
+    unprocessed_rows = [
+        {"商品ID": arrival.item_id, "标题": arrival.title, "档口": arrival.shop_name,
+         "状态": "未处理", "原因": stop_reason or "批次提前结束"}
+        for arrival in selected[len(report_rows):]
+    ]
+    sheets = [("本次汇总", summary_rows), ("上架结果", report_rows)]
+    if failed_rows:
+        sheets.append(("失败清单", failed_rows))
+    if uncertain_rows:
+        sheets.append(("待核实清单", uncertain_rows))
+    if unprocessed_rows:
+        sheets.append(("未处理清单", unprocessed_rows))
+    report_error = False
+    try:
+        report_path = export_workbook_xlsx(sheets, settings.artifacts_dir, f"{stem}-上架结果")
+        summary += f"\n结果 Excel：{report_path}"
+    except Exception as exc:  # noqa: BLE001 — 报表失败也必须展示本次执行总结
+        report_error = True
+        summary += f"\nExcel 保存失败：{exc}"
     print(summary)
-    if uncertain_ids:
-        print(f"待核实商品 ID：{','.join(uncertain_ids)}（详情见本次上架结果 Excel 和提交诊断）")
+    try:
+        summary_path = settings.artifacts_dir / f"{stem}-批次总结.txt"
+        summary_path.write_text(summary, encoding="utf-8")
+        print(f"总结文件：{summary_path}")
+    except OSError as exc:
+        report_error = True
+        print(f"总结文件保存失败：{exc}")
 
     if args.confirm_publish and args.hold_open_seconds > 0:
         print(f"浏览器将保持打开 {args.hold_open_seconds} 秒，可人工检查。")
         await page.wait_for_timeout(args.hold_open_seconds * 1000)
-    return 1 if failures or uncertain_count else 0
+    return 1 if counts["失败"] or counts["待核实"] or counts["未处理"] or report_error else 0
 
 
 async def list_from_shops(args: argparse.Namespace, settings: Settings) -> int:

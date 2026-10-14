@@ -17,6 +17,10 @@ class AlreadyListedError(RuntimeError):
     """商品已存在代销关系（已铺过），应跳过而不是重试。"""
 
 
+class UploadRejectedError(RuntimeError):
+    """页面明确拒绝提交，区别于网络中断等结果未知的情况。"""
+
+
 class UploadPlatformPage:
     def __init__(self, page: Page) -> None:
         self.page = page
@@ -225,7 +229,7 @@ class UploadPlatformPage:
                 return ListingStatus.UNCERTAIN
             for keyword in error_keywords:
                 if keyword in text:
-                    raise RuntimeError(f"确认上货后出现异常（「{keyword}」）：{text[:200]}")
+                    raise UploadRejectedError(f"确认上货后页面拒绝提交（「{keyword}」）：{text[:200]}")
             if any(keyword in text for keyword in ("提交成功", "任务创建成功", "上传成功", "上货成功")):
                 self.last_submission_detail = "页面显示明确提交成功提示，仍需核验目标平台是否上架"
                 return ListingStatus.SUBMITTED
