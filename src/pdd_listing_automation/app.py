@@ -3,22 +3,27 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import os
 import random
 import re
-import traceback
-from collections import Counter
 from contextlib import suppress
 from datetime import UTC, datetime
 
 from playwright.async_api import Page
 
+from pdd_listing_automation import __version__
 from pdd_listing_automation.browser.session import BrowserSession
+from pdd_listing_automation.cli import build_parser
 from pdd_listing_automation.config import Settings
-from pdd_listing_automation.models import ListingStatus, Platform, ShopNewArrival, SourceProduct
+from pdd_listing_automation.models import (
+    ListingStatus,
+    Platform,
+    ShopNewArrival,
+    SourceProduct,
+    has_listing,
+    market_from_url,
+)
 from pdd_listing_automation.pages.favorite_shops import FavoriteShopsPage
-from pdd_listing_automation.pages.pdd_draft import PddDraftPage
 from pdd_listing_automation.pages.product_detail import ProductDetailPage
 from pdd_listing_automation.pages.shop_catalog import ShopCatalogPage
 from pdd_listing_automation.pages.upload_platform import (
@@ -27,216 +32,21 @@ from pdd_listing_automation.pages.upload_platform import (
     UploadRejectedError,
 )
 from pdd_listing_automation.pages.upload_records import UploadRecordsPage
+from pdd_listing_automation.reports.batch_summary import (
+    LISTING_LABELS,
+    build_batch_summary,
+    format_batch_summary,
+)
 from pdd_listing_automation.reports.exporter import export_models, export_workbook_xlsx
 from pdd_listing_automation.services.discovery import DiscoveryService
+from pdd_listing_automation.services.drafts import publish_drafts, resolve_draft
+from pdd_listing_automation.services.evidence import (
+    _record_failure_evidence,
+    _save_submission_evidence,
+)
+from pdd_listing_automation.storage.batches import BatchJournal
 from pdd_listing_automation.storage.database import connect, initialize
 from pdd_listing_automation.storage.repositories import SourceProductRepository
-
-LISTING_LABELS = {
-    ListingStatus.RECORDED: "历史铺货记录（未核验在售）",
-    ListingStatus.SUBMITTED: "已提交（待核验上架）",
-    ListingStatus.UNCERTAIN: "提交结果待核实",
-}
-
-
-def build_batch_summary(rows: list[dict[str, str]], total: int) -> dict[str, int]:
-    statuses = Counter(row["状态"] for row in rows)
-    return {
-        "本次选择": total,
-        "已处理": len(rows),
-        "提交成功": statuses[LISTING_LABELS[ListingStatus.SUBMITTED]],
-        "失败": statuses["失败"],
-        "跳过": statuses["跳过（已有记录）"],
-        "待核实": statuses[LISTING_LABELS[ListingStatus.UNCERTAIN]],
-        "准备完成（未发布）": statuses["准备完成（未发布）"],
-        "未处理": max(0, total - len(rows)),
-    }
-
-
-def format_batch_summary(
-    rows: list[dict[str, str]], total: int, platform: Platform, target_shop: str,
-    stop_reason: str = "",
-) -> str:
-    counts = build_batch_summary(rows, total)
-    lines = [
-        "=" * 48,
-        "本次铺货总结",
-        f"平台：{platform.display_name}  目标店铺：{target_shop or '未指定'}",
-        f"本次选择 {total} 款，已处理 {counts['已处理']} 款，未处理 {counts['未处理']} 款",
-        (f"提交成功 {counts['提交成功']} 款 | 失败 {counts['失败']} 款 | "
-         f"跳过 {counts['跳过']} 款 | 待核实 {counts['待核实']} 款"),
-    ]
-    if counts["准备完成（未发布）"]:
-        lines.append(f"仅准备、未发布：{counts['准备完成（未发布）']} 款")
-    lines.append("平台最终上架状态尚未核验；上述成功数量指提交成功。")
-    for status, label in (("失败", "失败"), (LISTING_LABELS[ListingStatus.UNCERTAIN], "待核实")):
-        matches = [row for row in rows if row["状态"] == status]
-        if not matches:
-            continue
-        lines.append(f"{label}商品 ID：{','.join(row['商品ID'] for row in matches)}")
-        reasons = Counter(
-            " ".join(row.get("失败原因", "").split()) or "未获得明确结果，详见提交诊断"
-            for row in matches
-        )
-        for reason, count in reasons.items():
-            lines.append(f"  {count} 款：{reason[:200]}")
-    if stop_reason:
-        lines.append(f"提前结束原因：{stop_reason}")
-    lines.append("=" * 48)
-    return "\n".join(lines)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pdd-listing")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    subparsers.add_parser("init-db", help="初始化本地 SQLite 数据库")
-
-    scan = subparsers.add_parser("scan-records", help="采集 17zwd 上传记录")
-    scan.add_argument(
-        "--platform",
-        choices=["pinduoduo", "douyin", "拼多多", "抖音"],
-        default="pinduoduo",
-    )
-    scan.add_argument("--pages", type=int, default=1, help="最多采集多少页")
-    scan.add_argument(
-        "--login-wait-seconds",
-        type=int,
-        default=None,
-        help="等待人工完成登录的秒数",
-    )
-
-    prepare = subparsers.add_parser(
-        "prepare-upload",
-        help="从 17zwd 新品商品详情准备一次上传",
-    )
-    prepare.add_argument("--item-id", required=True, help="17zwd 商品 ID")
-    prepare.add_argument(
-        "--platform",
-        choices=["pinduoduo", "douyin", "拼多多", "抖音"],
-        required=True,
-    )
-    prepare.add_argument(
-        "--hold-open-seconds",
-        type=int,
-        default=0,
-        help="到达店铺选择后保持浏览器打开的秒数",
-    )
-    prepare.add_argument("--shop-name", default="", help="要选择的上货店铺名称")
-    prepare.add_argument(
-        "--confirm-publish",
-        default="",
-        metavar="PHRASE",
-        help="需要完整执行发布时传入确认短语 PUBLISH",
-    )
-
-    list_shops = subparsers.add_parser(
-        "list-from-shops",
-        help="从关注档口采集上新款，按选择一键上传到拼多多",
-    )
-    list_shops.add_argument(
-        "--platform",
-        choices=["pinduoduo", "douyin", "拼多多", "抖音"],
-        default="pinduoduo",
-    )
-    list_shops.add_argument("--pages", type=int, default=1, help="采集关注档口多少页")
-    list_shops.add_argument(
-        "--item-ids",
-        default="",
-        help="要上架的商品 ID，逗号分隔；与 --limit 都不给则只扫描不发布",
-    )
-    list_shops.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="按上新日期倒序取前 N 款上架",
-    )
-    list_shops.add_argument(
-        "--target-shop",
-        default="",
-        help="拼多多目标店铺名（默认空=停在选店窗口人工选）",
-    )
-    list_shops.add_argument(
-        "--confirm-publish",
-        default="",
-        metavar="PHRASE",
-        help="需要完整执行发布时传入确认短语 PUBLISH",
-    )
-    list_shops.add_argument("--delay-seconds", type=float, default=15.0, help="每款之间停顿秒数（防风控，实际随机 1~2 倍）")
-    list_shops.add_argument("--hold-open-seconds", type=int, default=0)
-
-    list_shop = subparsers.add_parser(
-        "list-from-shop",
-        help="扫描档口全量商品（含老品），按选择一键上传到拼多多",
-    )
-    list_shop.add_argument("--shop-url", required=True, help="档口商品页 URL（含 page=1&search=y）")
-    list_shop.add_argument(
-        "--platform",
-        choices=["pinduoduo", "douyin", "拼多多", "抖音"],
-        default="pinduoduo",
-    )
-    list_shop.add_argument("--pages", type=int, default=1, help="扫描多少页（每页约 140 款）")
-    list_shop.add_argument("--start-page", type=int, default=1, help="从第几页开始扫")
-    list_shop.add_argument("--item-ids", default="", help="要上架的商品 ID，逗号分隔")
-    list_shop.add_argument("--limit", type=int, default=0, help="按上新日期倒序取前 N 款上架")
-    list_shop.add_argument("--pick", action="store_true", help="扫描后按序号交互选择上架")
-    list_shop.add_argument("--target-shop", default="", help="拼多多目标店铺名")
-    list_shop.add_argument("--confirm-publish", default="", metavar="PHRASE")
-    list_shop.add_argument("--delay-seconds", type=float, default=15.0, help="每款之间停顿秒数（防风控，实际随机 1~2 倍）")
-    list_shop.add_argument("--hold-open-seconds", type=int, default=0)
-
-    reconcile = subparsers.add_parser(
-        "reconcile-shop",
-        help="校对档口商品：对比铺货记录，列出已上架和漏上的",
-    )
-    reconcile.add_argument("--shop-url", required=True, help="档口商品页 URL（含 page=1&search=y）")
-    reconcile.add_argument(
-        "--platform",
-        choices=["pinduoduo", "douyin", "拼多多", "抖音"],
-        default="pinduoduo",
-    )
-    reconcile.add_argument("--pages", type=int, default=1, help="扫描档口多少页")
-    reconcile.add_argument("--start-page", type=int, default=1, help="从第几页开始扫")
-    reconcile.add_argument("--record-pages", type=int, default=20, help="扫描铺货记录多少页")
-
-    publish = subparsers.add_parser(
-        "publish-drafts",
-        help="拼多多后台草稿箱：改价并提交上架（最后一步）",
-    )
-    publish.add_argument("--multiple", type=float, default=1.5, help="售价=货源价×倍数（可自定义）")
-    publish.add_argument("--limit", type=int, default=0, help="最多处理多少个草稿，默认全部")
-    publish.add_argument("--delay-seconds", type=float, default=10.0, help="每个草稿之间停顿秒数（防风控，实际随机 1~2 倍）")
-
-    subparsers.add_parser("menu", help="交互式菜单（一键启动）")
-
-    subparsers.add_parser(
-        "login",
-        help="单独打开浏览器登录 17zwd（强制有头模式，登录态持久化）",
-    )
-
-    report = subparsers.add_parser(
-        "export-report",
-        help="把铺货记录导出成 Excel（含档口/货号/价格/上架时间）",
-    )
-    report.add_argument(
-        "--platform",
-        choices=["pinduoduo", "douyin", "拼多多", "抖音", "all"],
-        default="all",
-        help="只导出某个平台，默认 all（全部）",
-    )
-    resolve = subparsers.add_parser("resolve-submission", help="人工核对上货日志后处理待核实记录")
-    resolve.add_argument("--platform", choices=["pinduoduo", "douyin"], required=True)
-    resolve.add_argument("--target-shop", required=True)
-    resolve.add_argument("--item-id", required=True)
-    resolve.add_argument(
-        "--outcome", choices=["recorded", "not-submitted"], required=True,
-        help="日志确认已铺货选 recorded；确认未提交选 not-submitted，允许重新处理",
-    )
-    resolve.add_argument(
-        "--include-recorded", action="store_true",
-        help="核对日志确认历史误标后，允许解除指定店铺 recorded 记录的拦截；不删除平台商品",
-    )
-    return parser
 
 
 async def _ensure_authenticated(page_obj, settings: Settings) -> None:
@@ -280,7 +90,8 @@ def export_report(settings: Settings, platform: Platform | None = None) -> int:
     with connect(settings.database_path) as connection:
         query = (
             "SELECT source_goods_id, title, source_sku, price_text, source_shop, "
-            "source_category, source_platform, uploaded_at_text, target_shop, listing_status "
+            "source_category, source_platform, uploaded_at_text, target_shop, listing_status, "
+            "source_market, source_url "
             "FROM source_products"
         )
         params: tuple = ()
@@ -297,6 +108,8 @@ def export_report(settings: Settings, platform: Platform | None = None) -> int:
     detail = [
         {
             "商品ID": r["source_goods_id"],
+            "来源站点": r["source_market"] or "未知（历史记录）",
+            "商品链接": r["source_url"],
             "标题": r["title"],
             "档口": r["source_shop"],
             "货号": r["source_sku"],
@@ -305,7 +118,7 @@ def export_report(settings: Settings, platform: Platform | None = None) -> int:
             "平台": Platform(r["source_platform"]).display_name,
             "目标店铺": r["target_shop"] or "未知（历史记录）",
             "状态": LISTING_LABELS[ListingStatus(r["listing_status"])],
-            "上架时间": r["uploaded_at_text"],
+            "记录时间": r["uploaded_at_text"],
         }
         for r in rows
     ]
@@ -337,12 +150,13 @@ def resolve_submission(args: argparse.Namespace, settings: Settings) -> int:
     if not args.target_shop.strip():
         raise ValueError("必须指定完整目标店铺名，不能处理未知店铺的历史记录")
     initialize(settings.database_path)
-    item_id, _ = parse_item_ref(args.item_id)
+    item_id, item_url = parse_item_ref(args.item_id)
     with connect(settings.database_path) as connection:
         updated = SourceProductRepository(connection).resolve_submission(
             Platform.parse(args.platform), args.target_shop.strip(), item_id,
             recorded=args.outcome == "recorded",
             include_recorded=getattr(args, "include_recorded", False),
+            source_market=getattr(args, "source_market", None) or market_from_url(item_url) or None,
         )
     if not updated:
         print("未找到该平台、店铺、商品对应的待核实/已提交记录。")
@@ -406,25 +220,6 @@ def parse_item_ref(value: str) -> tuple[str, str]:
 MAX_CONSECUTIVE_FAILURES = 5
 
 
-async def _record_failure_evidence(
-    page: Page, settings: Settings, item_id: str, error: Exception
-) -> None:
-    """失败时把浏览器各页截图落盘，并把错误与堆栈写入 failures.log，便于排查。"""
-    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    # 截图失败（如页面/浏览器已关闭）不影响写日志
-    with suppress(Exception):
-        for index, target in enumerate(page.context.pages):
-            tag = "main" if target is page else f"tab{index}"
-            url_part = re.sub(r"[^0-9A-Za-z.-]+", "_", target.url or "about:blank")[:40]
-            path = settings.artifacts_dir / f"failure-{item_id}-{timestamp}-{tag}-{url_part}.png"
-            await target.screenshot(path=str(path), full_page=False)
-    log_path = settings.artifacts_dir / "failures.log"
-    with suppress(OSError), log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"[{timestamp}] id={item_id} {type(error).__name__}: {error}\n")
-        handle.write("".join(traceback.format_exception(error)))
-        handle.write("\n")
-
-
 async def _close_leaked_upload_pages(page: Page) -> None:
     """关闭除主页面外的 t-onekey 上传页，避免下一条 start_upload 命中旧标签。"""
     for target in list(page.context.pages):
@@ -433,33 +228,6 @@ async def _close_leaked_upload_pages(page: Page) -> None:
         if "t-onekey.17zwd.com" in (target.url or ""):
             with suppress(Exception):
                 await target.close()
-
-
-async def _save_submission_evidence(
-    target: Page, settings: Settings, stem: str, item_id: str,
-    platform: Platform, target_shop: str, status: ListingStatus, detail: str, visible_text: str,
-) -> str:
-    """在关闭上传页之前记录最终反馈；关闭的页面也要留下关页原因。"""
-    settings.ensure_directories()
-    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
-    evidence_path = settings.artifacts_dir / f"{stem}-result-{timestamp}.json"
-    screenshot_path = evidence_path.with_suffix(".png")
-    evidence = {
-        "item_id": item_id, "platform": platform.value, "target_shop": target_shop,
-        "status": status.value, "detail": detail, "visible_text": visible_text,
-        "observed_at": datetime.now(UTC).isoformat(), "screenshot_path": "",
-    }
-    try:
-        await target.screenshot(path=str(screenshot_path), full_page=False, timeout=5_000)
-        evidence["screenshot_path"] = str(screenshot_path)
-    except Exception as exc:  # noqa: BLE001 — 页面已关闭也必须保留文字诊断
-        evidence["screenshot_error"] = f"{type(exc).__name__}: {exc}"
-    try:
-        evidence_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as exc:
-        print(f"  提交诊断保存失败：{exc}")
-        return ""
-    return str(evidence_path)
 
 
 async def run_single_upload(
@@ -473,6 +241,7 @@ async def run_single_upload(
     screenshot_stem: str,
     settings: Settings,
     source_arrival: ShopNewArrival | None = None,
+    database_initialized: bool = False,
 ) -> tuple[dict[str, str], Page | None, bool]:
     """单个商品的完整上传流程，停在“选择上货店铺”；确认短语为 PUBLISH 时才点开始上传。"""
     if confirm_publish:
@@ -480,13 +249,19 @@ async def run_single_upload(
             raise RuntimeError("发布确认短语不正确，必须为 PUBLISH")
         if not target_shop:
             raise RuntimeError("执行发布时必须指定目标店铺")
-        initialize(settings.database_path)
+        if not database_initialized:
+            initialize(settings.database_path)
         with connect(settings.database_path) as connection:
-            record = SourceProductRepository(connection).find_listing_record(platform, target_shop, item_id)
+            record = SourceProductRepository(connection).find_listing_record(
+                platform, target_shop, item_id, market_from_url(item_url) or "gz.17zwd.com",
+            )
             if record is not None:
                 scope = record["target_shop"] or "未知店铺（历史记录）"
                 label = LISTING_LABELS[ListingStatus(record["listing_status"])]
-                raise AlreadyListedError(f"本地记录拦截：{scope}，{label}；请先核对上货日志")
+                raise AlreadyListedError(
+                    f"本地记录拦截：{scope}，{label}；请先核对上货日志",
+                    ListingStatus(record["listing_status"]),
+                )
     product_page = ProductDetailPage(page)
     await product_page.open(item_url)
     summary = await product_page.collect_summary(item_id)
@@ -496,6 +271,9 @@ async def run_single_upload(
     await platform_page.confirm_superboss()
     await platform_page.wait_for_store_selection()
 
+    if confirm_publish:
+        await platform_page.accept_service_agreement()
+        await platform_page.accept_copy_commitment()
     if target_shop:
         await platform_page.select_shop(target_shop)
 
@@ -523,6 +301,7 @@ async def run_single_upload(
             with connect(settings.database_path) as connection:
                 SourceProductRepository(connection).resolve_submission(
                     platform, target_shop, item_id, recorded=False,
+                    source_market=arrival.source_market or "gz.17zwd.com",
                 )
             raise
         except Exception as exc:  # noqa: BLE001 — 进入提交阶段后出错必须保留待核实状态
@@ -582,9 +361,9 @@ async def prepare_upload(args: argparse.Namespace, settings: Settings) -> int:
     return 1 if published and result["listing_status"] == ListingStatus.UNCERTAIN else 0
 
 
-def print_arrivals(arrivals: list[ShopNewArrival], listed_ids: set[str], label: str = "商品") -> None:
-    unlisted = [a for a in arrivals if a.item_id not in listed_ids]
-    listed = [a for a in arrivals if a.item_id in listed_ids]
+def print_arrivals(arrivals: list[ShopNewArrival], listed_ids: set, label: str = "商品") -> None:
+    unlisted = [a for a in arrivals if not has_listing(a, listed_ids)]
+    listed = [a for a in arrivals if has_listing(a, listed_ids)]
     print(f"{label}共 {len(arrivals)} 款：可处理 {len(unlisted)} 款 / 已有记录 {len(listed)} 款（按上新日期倒序）")
     print(f"—— 未上架 {len(unlisted)} 款 ——")
     for index, arrival in enumerate(unlisted, 1):
@@ -602,23 +381,38 @@ def print_arrivals(arrivals: list[ShopNewArrival], listed_ids: set[str], label: 
 def select_arrivals(
     arrivals: list[ShopNewArrival],
     args: argparse.Namespace,
-    listed_ids: set[str],
+    listed_ids: set,
 ) -> tuple[list[ShopNewArrival], list[ShopNewArrival]]:
     """按 --item-ids / --limit 选款，返回 (要上架的, 已上过被跳过的)。"""
     if args.item_ids:
         wanted = list(dict.fromkeys(
             part.strip() for part in args.item_ids.replace("，", ",").split(",") if part.strip()
         ))
-        by_id = {arrival.item_id: arrival for arrival in arrivals}
+        by_id: dict[str, list[ShopNewArrival]] = {}
+        by_key = {arrival.product_key: arrival for arrival in arrivals}
+        for arrival in arrivals:
+            by_id.setdefault(arrival.item_id, []).append(arrival)
         selected: list[ShopNewArrival] = []
         skipped: list[ShopNewArrival] = []
-        for item_id in wanted:
-            arrival = by_id.get(item_id)
+        chosen_keys: set[tuple[str, str]] = set()
+        for ref in wanted:
+            item_id, url = parse_item_ref(ref)
+            market = market_from_url(url)
+            if market:
+                arrival = by_key.get((market, item_id))
+            else:
+                matches = by_id.get(item_id, [])
+                if len(matches) > 1:
+                    raise RuntimeError(f"商品 ID {item_id} 存在多个来源站点，请传入完整商品链接")
+                arrival = matches[0] if matches else None
             if arrival is None:
                 raise RuntimeError(
                     f"商品 ID {item_id} 不在本次扫描结果中，请核对 ID 或增加 --pages"
                 )
-            if arrival.item_id in listed_ids:
+            if arrival.product_key in chosen_keys:
+                continue
+            chosen_keys.add(arrival.product_key)
+            if has_listing(arrival, listed_ids):
                 skipped.append(arrival)
             else:
                 selected.append(arrival)
@@ -629,7 +423,7 @@ def select_arrivals(
         for arrival in arrivals:
             if len(selected) >= args.limit:
                 break
-            if arrival.item_id in listed_ids:
+            if has_listing(arrival, listed_ids):
                 skipped.append(arrival)
             else:
                 selected.append(arrival)
@@ -672,7 +466,6 @@ def _mark_listed(
     target_shop: str, summary: dict[str, str], listing_status: ListingStatus,
 ) -> None:
     """记录提交状态和完整货源信息，阻止未经核实的重复提交。"""
-    initialize(settings.database_path)
     with connect(settings.database_path) as connection:
         SourceProductRepository(connection).upsert_many(
             [
@@ -686,6 +479,8 @@ def _mark_listed(
                     source_category=arrival.shop_main_category,
                     image_url=arrival.image_url,
                     source_platform=platform,
+                    source_market=arrival.source_market or "gz.17zwd.com",
+                    source_url=arrival.item_url if market_from_url(arrival.item_url) else f"https://gz.17zwd.com/item/{arrival.item_id}",
                     target_shop=target_shop,
                     listing_status=listing_status,
                     uploaded_at_text=datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
@@ -704,11 +499,11 @@ async def _process_arrivals(
     label: str,
 ) -> int:
     # 去重：同一商品可能出现在多页，只保留一份
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     deduped: list[ShopNewArrival] = []
     for arrival in arrivals:
-        if arrival.item_id not in seen:
-            seen.add(arrival.item_id)
+        if arrival.product_key not in seen:
+            seen.add(arrival.product_key)
             deduped.append(arrival)
     arrivals = deduped
 
@@ -721,7 +516,7 @@ async def _process_arrivals(
     settings.ensure_directories()
     initialize(settings.database_path)
     with connect(settings.database_path) as connection:
-        listed_ids = SourceProductRepository(connection).listed_goods_ids(platform, args.target_shop)
+        listed_ids = SourceProductRepository(connection).listed_product_keys(platform, args.target_shop)
 
     print_arrivals(arrivals, listed_ids, label)
 
@@ -731,9 +526,16 @@ async def _process_arrivals(
     print(f"JSON：{json_path}")
     print(f"CSV：{csv_path}")
 
-    unlisted = [a for a in arrivals if a.item_id not in listed_ids]
+    unlisted = [a for a in arrivals if not has_listing(a, listed_ids)]
 
-    if getattr(args, "pick", False) and not args.item_ids and not args.limit:
+    resume_id = getattr(args, "resume_batch", "")
+    skipped: list[ShopNewArrival] = []
+    saved_items: list[dict] = []
+    if resume_id:
+        journal = BatchJournal(settings.database_path, resume_id)
+        _, saved_items = journal.load()
+        selected = [item["arrival"] for item in saved_items if item["state"] != "done"]
+    elif getattr(args, "pick", False) and not args.item_ids and not args.limit:
         text = input("上架哪几款？输入 n 上最新 n 款；输入 1,3,5 或 1-5 按「未上架」序号选；回车只看货：").strip()
         if not text:
             print("未选择，仅完成扫描（未上架）。")
@@ -743,9 +545,9 @@ async def _process_arrivals(
         else:
             selected = [unlisted[i] for i in parse_selection(text, len(unlisted))]
     else:
-        selected, _ = select_arrivals(arrivals, args, listed_ids)
+        selected, skipped = select_arrivals(arrivals, args, listed_ids)
 
-    if not selected:
+    if not selected and not skipped and not resume_id:
         print("没有可上架的商品（可能都已上过，或未选择）。")
         return 0
 
@@ -759,11 +561,31 @@ async def _process_arrivals(
                 "菜单里请先填写店铺名；命令行请加 --target-shop \"你的店铺名\"。"
             )
 
-    print(f"本次将处理 {len(selected)} 款。")
+    if not resume_id:
+        journal = BatchJournal.create(settings.database_path, {
+            "platform": platform.value, "target_shop": args.target_shop,
+            "confirm_publish": args.confirm_publish, "delay_seconds": getattr(args, "delay_seconds", 15.0),
+            "hold_open_seconds": args.hold_open_seconds, "stem_prefix": stem_prefix, "label": label,
+        }, skipped + selected)
+        for position, arrival in enumerate(skipped):
+            journal.record(position, {
+                "商品ID": arrival.item_id, "来源站点": arrival.source_market,
+                "商品链接": arrival.item_url, "标题": arrival.title, "档口": arrival.shop_name,
+                "目标店铺": args.target_shop, "状态": "跳过（已有记录）",
+                "失败原因": "本地已有铺货或待核实记录；未重新提交",
+                "处理时间": datetime.now(UTC).isoformat(),
+            })
+        _, saved_items = journal.load()
+    total = len(saved_items)
+    positions = [item["position"] for item in saved_items if item["state"] != "done"]
+    stem = f"{stem_prefix}-{platform.value}-{journal.batch_id}"
+    print(f"批次 ID：{journal.batch_id}；本次待处理 {len(selected)} 款。")
+    print(f"程序版本：{__version__}")
+    print(f"中断后可运行：pdd-listing resume-batch --batch-id {journal.batch_id}")
     consecutive_failures = 0
     stop_reason = ""
     delay_seconds = float(getattr(args, "delay_seconds", 15.0))
-    report_rows: list[dict[str, str]] = []
+    report_rows: list[dict[str, str]] = [item["result"] for item in saved_items if item["result"]]
     for index, arrival in enumerate(selected, 1):
         name = arrival.title or arrival.shop_name or arrival.item_id
         print(f"[{index}/{len(selected)}] id={arrival.item_id}（{name}）")
@@ -774,6 +596,7 @@ async def _process_arrivals(
 
         # 上架不做自动重试：一旦点了「确认上货」可能已部分提交，重试会导致重复上架
         platform_page_target: Page | None = None
+        journal.start(positions[index - 1])
         try:
             result, platform_page_target, published = await run_single_upload(
                 page,
@@ -782,9 +605,10 @@ async def _process_arrivals(
                 platform=platform,
                 target_shop=args.target_shop,
                 confirm_publish=args.confirm_publish,
-                screenshot_stem=f"{stem_prefix}-{platform.value}-{arrival.item_id}",
+                screenshot_stem=f"{stem}-{arrival.source_market}-{arrival.item_id}",
                 settings=settings,
                 source_arrival=arrival,
+                database_initialized=True,
             )
             if not published and args.hold_open_seconds > 0:
                 print(f"  准备完成，保留选店页面 {args.hold_open_seconds} 秒供人工检查。")
@@ -810,7 +634,6 @@ async def _process_arrivals(
             consecutive_failures = 0
             if published:
                 status = ListingStatus(result["listing_status"])
-                _mark_listed(settings, arrival, platform, args.target_shop, result, status)
                 status_label = LISTING_LABELS[status]
             else:
                 status_label = "准备完成（未发布）"
@@ -839,6 +662,7 @@ async def _process_arrivals(
         elif skip:
             consecutive_failures = 0
             print(f"  ⏭ 跳过：{error}")
+            recovered_status = getattr(error, "listing_status", None) if resume_id else None
             report_rows.append({
                 "商品ID": arrival.item_id,
                 "标题": arrival.title,
@@ -847,7 +671,9 @@ async def _process_arrivals(
                 "货号": "",
                 "货源价": arrival.price_text,
                 "目标店铺": args.target_shop,
-                "状态": "跳过（已有记录）",
+                "状态": LISTING_LABELS[recovered_status] if recovered_status in (
+                    ListingStatus.UNCERTAIN, ListingStatus.SUBMITTED,
+                ) else "跳过（已有记录）",
                 "失败原因": str(error),
                 "处理时间": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
             })
@@ -869,14 +695,17 @@ async def _process_arrivals(
             if "closed" in str(error).lower() or "TargetClosed" in type(error).__name__:
                 stop_reason = "浏览器已关闭"
                 print("  （浏览器已关闭，停止后续上架）")
-                break
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            elif consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 stop_reason = f"连续失败 {consecutive_failures} 次"
                 print(
                     f"  （连续失败 {consecutive_failures} 次，自动暂停上架，"
                     "先排查原因再继续，详见 artifacts/failures.log）"
                 )
-                break
+
+        report_rows[-1].update({"来源站点": arrival.source_market, "商品链接": arrival.item_url})
+        journal.record(positions[index - 1], report_rows[-1])
+        if stop_reason:
+            break
 
         # 每款之间随机停顿，降低风控/浏览器崩溃概率
         if delay_seconds > 0 and index < len(selected):
@@ -889,8 +718,12 @@ async def _process_arrivals(
                     break
                 raise
 
-    counts = build_batch_summary(report_rows, len(selected))
-    summary = format_batch_summary(report_rows, len(selected), platform, args.target_shop, stop_reason)
+    journal.finish()
+    _, saved_items = journal.load()
+    report_rows = [item["result"] for item in saved_items if item["result"]]
+    counts = build_batch_summary(report_rows, total)
+    summary = format_batch_summary(report_rows, total, platform, args.target_shop, stop_reason)
+    summary = f"批次 ID：{journal.batch_id}\n" + summary
     summary_rows = [
         {"项目": "平台", "结果": platform.display_name},
         {"项目": "目标店铺", "结果": args.target_shop or "未指定"},
@@ -903,7 +736,7 @@ async def _process_arrivals(
     unprocessed_rows = [
         {"商品ID": arrival.item_id, "标题": arrival.title, "档口": arrival.shop_name,
          "状态": "未处理", "原因": stop_reason or "批次提前结束"}
-        for arrival in selected[len(report_rows):]
+        for arrival in [item["arrival"] for item in saved_items if item["state"] != "done"]
     ]
     sheets = [("本次汇总", summary_rows), ("上架结果", report_rows)]
     if failed_rows:
@@ -928,7 +761,7 @@ async def _process_arrivals(
         report_error = True
         print(f"总结文件保存失败：{exc}")
 
-    if args.confirm_publish and args.hold_open_seconds > 0:
+    if selected and args.confirm_publish and args.hold_open_seconds > 0:
         print(f"浏览器将保持打开 {args.hold_open_seconds} 秒，可人工检查。")
         await page.wait_for_timeout(args.hold_open_seconds * 1000)
     return 1 if counts["失败"] or counts["待核实"] or counts["未处理"] or report_error else 0
@@ -947,6 +780,33 @@ async def list_from_shops(args: argparse.Namespace, settings: Settings) -> int:
         )
 
 
+async def resume_batch(args: argparse.Namespace, settings: Settings) -> int:
+    initialize(settings.database_path)
+    options, items = BatchJournal(settings.database_path, args.batch_id).load()
+    print(f"恢复原批次：{options['platform']} / {options['target_shop']}；"
+          + ("继续已确认的发布任务。" if options["confirm_publish"] else "仅准备，不自动提交。"))
+    saved_args = argparse.Namespace(**options, resume_batch=args.batch_id, item_ids="", limit=0)
+    arrivals = [item["arrival"] for item in items]
+    platform = Platform.parse(options["platform"])
+    if all(item["state"] == "done" for item in items):
+        return await _process_arrivals(
+            None, arrivals, saved_args, settings, platform, options["stem_prefix"], options["label"],
+        )
+    async with BrowserSession(settings).open() as (_, page):
+        return await _process_arrivals(
+            page, arrivals, saved_args, settings, platform, options["stem_prefix"], options["label"],
+        )
+
+
+def list_batches(settings: Settings) -> int:
+    initialize(settings.database_path)
+    for batch in BatchJournal.recent(settings.database_path):
+        options = json.loads(batch["options_json"])
+        print(f"{batch['batch_id']}  {options['platform']} / {options['target_shop']}  "
+              f"已处理 {batch['processed']}/{batch['total']}  {batch['state']}")
+    return 0
+
+
 async def list_from_shop(args: argparse.Namespace, settings: Settings) -> int:
     platform = Platform.parse(args.platform)
     async with BrowserSession(settings).open() as (_, page):
@@ -959,7 +819,7 @@ async def list_from_shop(args: argparse.Namespace, settings: Settings) -> int:
 
 
 async def reconcile_shop(args: argparse.Namespace, settings: Settings) -> int:
-    """校对：对比档口商品与铺货记录，列出已上架和漏上的。"""
+    """对比有限扫描范围的铺货记录；不把存在记录等同于已在售。"""
     platform = Platform.parse(args.platform)
     async with BrowserSession(settings).open() as (_, page):
         catalog_page = ShopCatalogPage(page)
@@ -982,25 +842,36 @@ async def reconcile_shop(args: argparse.Namespace, settings: Settings) -> int:
             except RuntimeError:
                 break
 
-    listed_ids = {p.source_goods_id for p in listed_products}
+    initialize(settings.database_path)
+    with connect(settings.database_path) as connection:
+        listed_ids = SourceProductRepository(connection).listed_product_keys(
+            platform, getattr(args, "target_shop", ""),
+        )
+    # 线上记录没有可靠的目标店铺信息，不能用它证明指定店铺已铺货。
+    unknown_ids = {(p.source_market, p.source_goods_id) for p in listed_products}
+    if not getattr(args, "target_shop", ""):
+        listed_ids |= unknown_ids
 
     # 去重后对比
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     deduped: list[ShopNewArrival] = []
     for arrival in arrivals:
-        if arrival.item_id not in seen:
-            seen.add(arrival.item_id)
+        if arrival.product_key not in seen:
+            seen.add(arrival.product_key)
             deduped.append(arrival)
 
-    listed = [a for a in deduped if a.item_id in listed_ids]
-    missing = [a for a in deduped if a.item_id not in listed_ids]
+    listed = [a for a in deduped if has_listing(a, listed_ids)]
+    missing = [a for a in deduped if not has_listing(a, listed_ids)]
 
-    print(f"档口商品共 {len(deduped)} 款：已上架 {len(listed)} 款，漏上 {len(missing)} 款")
+    print(f"档口商品共 {len(deduped)} 款：有铺货或提交记录 {len(listed)} 款，本次未查到 {len(missing)} 款")
+    print(f"仅核对本地记录及最多 {args.record_pages} 页线上记录，未核验平台在售状态。")
+    if getattr(args, "target_shop", ""):
+        print("线上记录的目标店铺未知，不作为指定店铺的铺货证明；本地未知店铺记录仍保守提示。")
     if listed:
-        print(f"—— 已上架 {len(listed)} 款 ——")
+        print(f"—— 有铺货或提交记录 {len(listed)} 款 ——")
         for a in listed:
             print(f"  ✅ {a.title} id={a.item_id}")
-    print(f"—— 漏上 {len(missing)} 款 ——")
+    print(f"—— 本次未查到记录 {len(missing)} 款 ——")
     for a in missing:
         price = f" ¥{a.price_text}" if a.price_text else ""
         date = f" {a.on_shelf_date_text}上新" if a.on_shelf_date_text else ""
@@ -1014,78 +885,8 @@ async def reconcile_shop(args: argparse.Namespace, settings: Settings) -> int:
     _, missing_csv = export_models(
         missing, settings.artifacts_dir, f"reconcile-missing-{platform.value}-{timestamp}",
     )
-    print(f"已上架 CSV：{listed_csv}")
-    print(f"漏上 CSV：{missing_csv}")
-    return 0
-
-
-def load_source_prices(settings: Settings) -> dict[str, float]:
-    """从本地库读货源价：{17zwd 商品 ID: 货源价}。"""
-    initialize(settings.database_path)
-    with connect(settings.database_path) as connection:
-        rows = connection.execute(
-            "SELECT source_goods_id, price_text FROM source_products "
-            "WHERE source_platform = 'pinduoduo' AND price_text != '' "
-            "ORDER BY collected_at DESC"
-        ).fetchall()
-    result: dict[str, float] = {}
-    for row in rows:
-        text = (row["price_text"] or "").replace("¥", "").replace("￥", "").strip()
-        try:
-            price = float(text)
-            if math.isfinite(price) and price > 0 and row["source_goods_id"] not in result:
-                result[row["source_goods_id"]] = price
-        except (TypeError, ValueError):
-            continue
-    return result
-
-
-async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
-    """拼多多后台草稿箱：改价（货源价×倍数）并提交上架，完成最后一步。"""
-    multiple = float(args.multiple)
-    if not math.isfinite(multiple) or multiple <= 0:
-        raise ValueError("售价倍数必须是有限正数")
-    if settings.headless:
-        raise RuntimeError("草稿箱可能需要人工完成验证码，请设置 PDD_AUTOMATION_HEADLESS=false 后运行。")
-    source_prices = load_source_prices(settings)
-    async with BrowserSession(settings).open() as (_, page):
-        draft_page = PddDraftPage(page)
-        await draft_page.open_draft_box()
-        skus = await draft_page.collect_skus()
-        print(f"草稿箱共 {len(skus)} 个草稿，售价 = 货源价 × {multiple}")
-        if args.limit:
-            skus = skus[: args.limit]
-
-        success = 0
-        delay = float(getattr(args, "delay_seconds", 10.0))
-        for index, sku in enumerate(skus, 1):
-            source_price = source_prices.get(sku)
-            if source_price is None:
-                print(f"[{index}/{len(skus)}] {sku} 未找到货源价，跳过")
-                continue
-            target = round(source_price * multiple, 2)
-            print(f"[{index}/{len(skus)}] {sku} 货源¥{source_price} → ¥{target}")
-            edit_page = await draft_page.edit_draft(sku)
-            if edit_page is None:
-                print("  ❌ 找不到编辑入口，跳过")
-                continue
-            await edit_page.wait_for_timeout(5_000)
-            await draft_page.set_prices(edit_page, source_price, multiple)
-            status = await draft_page.submit_and_wait(edit_page)
-            if status == "success":
-                success += 1
-            print(f"  结果：{status}")
-            await draft_page.close_page(edit_page)
-            if status != "success":
-                print("  发布结果待核实，暂停本批次，请在拼多多后台检查后再继续。")
-                return 1
-            # 每个草稿之间随机停顿，降低触发风控的概率
-            if delay > 0 and index < len(skus):
-                wait = delay * random.uniform(1.0, 2.0)
-                print(f"    停顿 {wait:.1f} 秒防风控……")
-                await page.wait_for_timeout(wait * 1000)
-
-        print(f"完成：成功 {success} / 共 {len(skus)}")
+    print(f"有记录 CSV：{listed_csv}")
+    print(f"本次未查到 CSV：{missing_csv}")
     return 0
 
 
@@ -1121,6 +922,7 @@ def run_menu(settings: Settings) -> int:
         print("=" * 42)
         print("  17zwd 铺货助手（一键启动）")
         print("=" * 42)
+        print(f"  程序版本：{__version__}")
         print(f"  平台：{display}    目标店铺：{shop}")
         print(f"  运行模式：{mode}")
         print(f"  每款停顿：{delay} 秒起（随机 {delay}~{delay * 2:.0f} 秒）")
@@ -1130,15 +932,35 @@ def run_menu(settings: Settings) -> int:
         print("  3. 上架最新 N 款（真实发布）")
         print("  4. 上架指定商品 ID（真实发布）")
         print("  5. 上架档口老品（贴档口商品页链接）")
-        print("  6. 校对档口（已上架/漏上）")
-        print("  8. 导出上架清单（Excel，含档口）")
-        print("  0. 切换平台（拼多多/抖音）")
-        print("  7. 退出")
+        print("  6. 校对档口铺货记录（不等同于在售）")
+        print("  7. 导出上架清单（Excel，含档口）")
+        print("  8. 查看批次 / 继续未完成项")
+        print("  9. 切换平台（拼多多/抖音）")
+        print(" 10. 选择运行模式（前台/后台）")
+        print("  0. 退出")
         print("=" * 42)
 
-        choice = input("请选择 (0-8)：").strip()
+        choice = input("请选择 (0-10)：").strip()
         if choice == "0":
+            print("退出。")
+            return 0
+        if choice == "9":
             platform = "douyin" if platform == "pinduoduo" else "pinduoduo"
+            continue
+        if choice == "10":
+            print(f"当前运行模式：{mode}")
+            print("  1. 前台（可见浏览器，便于登录和验证码）")
+            print("  2. 后台（不弹浏览器窗口）")
+            while True:
+                mode_choice = input("选择运行模式 (1/2，回车保持当前模式)：").strip()
+                if not mode_choice:
+                    break
+                if mode_choice in ("1", "2"):
+                    settings.headless = mode_choice == "2"
+                    selected_mode = "后台（不弹浏览器）" if settings.headless else "前台（可见浏览器）"
+                    print(f"已选择{selected_mode}，后续任务使用此模式。")
+                    break
+                print("请输入 1 或 2，或回车保持当前模式。")
             continue
         if choice == "1":
             args = argparse.Namespace(
@@ -1207,16 +1029,19 @@ def run_menu(settings: Settings) -> int:
                 page_count = 1
             args = argparse.Namespace(
                 shop_url=url, platform=platform, pages=page_count, start_page=start_page, record_pages=20,
+                target_shop=shop,
             )
             _run(reconcile_shop(args, settings))
-        elif choice == "8":
+        elif choice == "7":
             try:
                 export_report(settings, Platform.parse(platform))
             except Exception as exc:  # noqa: BLE001 — 导出失败保留菜单
                 print(f"\n[失败] {exc}\n")
-        elif choice == "7":
-            print("退出。")
-            return 0
+        elif choice == "8":
+            list_batches(settings)
+            batch_id = input("输入要继续的批次 ID（回车返回）：").strip()
+            if batch_id:
+                _run(resume_batch(argparse.Namespace(batch_id=batch_id), settings))
         else:
             print("无效选择，请重新输入。")
 
@@ -1231,6 +1056,10 @@ def main() -> int:
         initialize(settings.database_path)
         print(f"数据库已初始化：{settings.database_path}")
         return 0
+    if args.command == "list-batches":
+        return list_batches(settings)
+    if args.command == "resume-batch":
+        return asyncio.run(resume_batch(args, settings))
     if args.command == "login":
         return asyncio.run(login(settings))
     if args.command == "export-report":
@@ -1250,6 +1079,8 @@ def main() -> int:
         return asyncio.run(reconcile_shop(args, settings))
     if args.command == "publish-drafts":
         return asyncio.run(publish_drafts(args, settings))
+    if args.command == "resolve-draft":
+        return resolve_draft(args, settings)
     if args.command == "menu":
         return run_menu(settings)
 

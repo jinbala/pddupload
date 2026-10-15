@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import re
 from contextlib import suppress
+from time import monotonic
 
-from playwright.async_api import Locator, Page
+from playwright.async_api import Locator, Page, expect
 
 from pdd_listing_automation.models import ListingStatus
+from pdd_listing_automation.pages.feedback import REJECTION, SUCCESS, visible_feedback
 
 
 def _is_closed_error(exc: Exception) -> bool:
@@ -15,6 +17,10 @@ def _is_closed_error(exc: Exception) -> bool:
 
 class AlreadyListedError(RuntimeError):
     """商品已存在代销关系（已铺过），应跳过而不是重试。"""
+
+    def __init__(self, message: str, listing_status: ListingStatus | None = None):
+        super().__init__(message)
+        self.listing_status = listing_status
 
 
 class UploadRejectedError(RuntimeError):
@@ -26,6 +32,16 @@ class UploadPlatformPage:
         self.page = page
         self.last_submission_detail = "尚未点击确认上货"
         self.last_visible_text = ""
+        self._selected_checkbox: Locator | None = None
+        self._selected_shop_row: Locator | None = None
+        self._feedback_before: set[str] = set()
+
+    async def _feedback(self) -> list[str]:
+        result: list[str] = []
+        # 一个 frame 一次浏览器调用，避免按节点往返读取。
+        for frame in self.page.frames:
+            result.extend(await visible_feedback(frame))
+        return result
 
     def store_dialog(self):
         return self.page.frame_locator("iframe").get_by_role(
@@ -48,15 +64,12 @@ class UploadPlatformPage:
         return " | ".join(parts)[:limit]
 
     async def _visible_success_text(self) -> str:
-        """直接查找可见反馈，避免长规格表把页尾或外层通知挤出文本截断范围。"""
-        pattern = re.compile(r"^(?:提交成功|任务创建成功|上传成功|上货成功)(?:$|[\s！!。，,:：])")
-        for root in (self.page.frame_locator("iframe").first, self.page):
-            candidates = root.get_by_text(pattern)
-            for index in range(await candidates.count()):
-                candidate = candidates.nth(index)
-                if await candidate.is_visible():
-                    return await candidate.inner_text(timeout=1_000)
-        return ""
+        feedback = set(await self._feedback()) - self._feedback_before
+        self.last_visible_text = " | ".join(sorted(feedback))
+        for text in feedback:
+            if REJECTION.match(text):
+                raise UploadRejectedError(f"页面拒绝提交：{text}")
+        return next((text for text in feedback if SUCCESS.fullmatch(text)), "")
 
     async def confirm_superboss(self) -> None:
         await self.page.wait_for_load_state("domcontentloaded")
@@ -86,7 +99,6 @@ class UploadPlatformPage:
                 if attempt == 0:
                     # iframe 可能加载慢/失败，重载当前 t-onekey 页再等一次
                     await self.page.reload(wait_until="domcontentloaded")
-                    await self.page.wait_for_timeout(2_000)
                 else:
                     raise
 
@@ -107,10 +119,81 @@ class UploadPlatformPage:
         checkbox = row.locator('input[type="checkbox"]')
         if await checkbox.count() != 1:
             raise RuntimeError(f"目标店铺复选框定位失败：{shop_name}")
-        if not await checkbox.is_checked():
-            await row.locator("span.ant-checkbox-inner").evaluate("(el) => el.click()")
-        if not await checkbox.is_checked():
-            raise RuntimeError(f"目标店铺选中失败：{shop_name}")
+        self._selected_checkbox = checkbox
+        self._selected_shop_row = row
+        # 只操作与目标店铺相同列表的店铺行，不遍历整个弹窗的复选框。
+        target_handle = await checkbox.element_handle()
+        for field in await self._shop_checkboxes():
+            if await field.evaluate("(el, target) => el === target", target_handle):
+                continue
+            if await field.is_checked():
+                await self._set_checked(field, False)
+        await self._set_checked(checkbox, True)
+        self._selected_checkbox = checkbox
+        await self.verify_shop_selection()
+
+    async def _shop_checkboxes(self) -> list[Locator]:
+        if self._selected_shop_row is None:
+            raise RuntimeError("尚未定位店铺列表")
+        body = self._selected_shop_row.locator("xpath=ancestor-or-self::tbody[1]")
+        if await body.count():
+            rows = body.locator(":scope > tr")
+        else:
+            # 兼容没有 table 的店铺卡片/label 列表；只看同级行。
+            rows = self._selected_shop_row.locator("xpath=..").locator(":scope > *")
+        fields = []
+        target = await self._selected_checkbox.element_handle()
+        for row in await rows.all():
+            checkbox = row.locator('input[type="checkbox"]')
+            if await checkbox.count() != 1:
+                continue
+            text = " ".join((await row.inner_text()).split())
+            # 目标店铺名称即便包含这些词，也必须保留用于最终校验。
+            if re.search(r"承诺|协议|签署|隐私|已阅读|已知晓|我已|全选", text) and not await checkbox.evaluate(
+                "(el, target) => el === target", target,
+            ):
+                continue
+            if not text:
+                continue
+            fields.append(checkbox)
+        if not fields:
+            raise RuntimeError("未识别到可靠的店铺列表，停止选店")
+        return fields
+
+    async def _set_checked(self, field: Locator, checked: bool) -> None:
+        if await field.is_checked() == checked:
+            return
+        if not await field.is_enabled():
+            raise RuntimeError("复选框不可修改，停止提交")
+        if await field.is_visible():
+            await field.click(timeout=5_000)
+        else:
+            # 部分版本隐藏原生 input，仅让 Ant Checkbox 的外观接收点击。
+            visual = field.locator("xpath=..").locator("span.ant-checkbox-inner")
+            if await visual.count() != 1:
+                raise RuntimeError("复选框没有唯一可见点击入口，停止提交")
+            await visual.click(timeout=5_000)
+        await expect(field).to_be_checked(checked=checked, timeout=5_000)
+
+    async def _commitment_checkbox(self) -> Locator | None:
+        commitment = self.store_dialog().get_by_text("已签署商家搬家承诺书", exact=False)
+        if await commitment.count() == 0:
+            return None
+        if await commitment.count() != 1:
+            raise RuntimeError("商家搬家承诺书定位不唯一，停止提交")
+        row = commitment.locator("xpath=ancestor::*[.//input[@type='checkbox']][1]")
+        checkbox = row.locator('input[type="checkbox"]')
+        if await checkbox.count() != 1:
+            raise RuntimeError("商家搬家承诺书复选框定位失败")
+        return checkbox
+
+    async def verify_shop_selection(self) -> None:
+        if self._selected_checkbox is None or not await self._selected_checkbox.is_checked():
+            raise RuntimeError("未确认唯一目标店铺，停止提交")
+        target = await self._selected_checkbox.element_handle()
+        for field in await self._shop_checkboxes():
+            if await field.is_checked() and not await field.evaluate("(el, target) => el === target", target):
+                raise RuntimeError("检测到额外选中的店铺，停止提交")
 
     async def _find_shop_row(self, dialog: Locator, shop_name: str, exact: bool) -> Locator | None:
         """在选店弹窗里找含 shop_name 且带复选框的店铺行；找不到返回 None。"""
@@ -126,24 +209,90 @@ class UploadPlatformPage:
             raise RuntimeError(f"店铺名称匹配到多条记录：{shop_name}，请使用完整名称")
         return matches[0] if matches else None
 
-    async def accept_commitment(self) -> None:
-        """签署「商家搬家承诺书」。若当前平台/店铺没有该承诺书（如抖音）则跳过。"""
-        dialog = self.store_dialog()
-        commitment = dialog.get_by_text("已签署商家搬家承诺书", exact=False)
-        if await commitment.count() != 1:
-            # 抖音等平台可能没有该承诺书，直接跳过而不是报错
-            return
+    async def accept_service_agreement(self) -> bool:
+        """仅在已确认发布的流程中，处理已识别的超级店长协议弹窗。"""
+        handled = False
+        for frame in self.page.frames:
+            titles = frame.get_by_text("超级店长用户服务协议和隐私政策", exact=True)
+            for title in await titles.all():
+                if not await title.is_visible():
+                    continue
+                # 按已知标题及同一弹窗的按钮限定作用域，不点击其他“同意”按钮。
+                modal = title.locator(
+                    "xpath=ancestor::*[.//*[self::button or @role='button']"
+                    "[contains(., '同意并继续')]][1]"
+                )
+                button = modal.get_by_role("button", name="同意并继续", exact=True)
+                if await button.count() != 1:
+                    raise RuntimeError("超级店长协议弹窗确认按钮不唯一，停止提交")
+                await button.click(timeout=5_000)
+                await expect(title).to_be_hidden(timeout=10_000)
+                handled = True
+        return handled
 
-        row = commitment.locator("xpath=ancestor::*[.//input[@type='checkbox']][1]")
-        checkbox = row.locator('input[type="checkbox"]')
-        if await checkbox.count() != 1:
-            raise RuntimeError("商家搬家承诺书复选框定位失败")
-        if not await checkbox.is_checked():
-            await row.locator("span.ant-checkbox-inner").evaluate("(el) => el.click()")
-        if not await checkbox.is_checked():
-            raise RuntimeError("商家搬家承诺书确认失败")
+    async def accept_commitment(self) -> None:
+        """协议弹窗和承诺书分开处理；等待受控复选框的异步状态更新。"""
+        await self.accept_service_agreement()
+        await self.accept_copy_commitment()
+        checkbox = await self._commitment_checkbox()
+        if checkbox is None or await checkbox.is_checked():
+            return
+        if not await checkbox.is_enabled():
+            raise RuntimeError("商家搬家承诺书不可勾选，停止提交")
+        # 正常点击遵守遮罩和可见性，不再用 JS 穿透协议弹窗点击底层。
+        if await checkbox.is_visible():
+            await checkbox.click(timeout=5_000)
+        else:
+            visual = checkbox.locator("xpath=..").locator("span.ant-checkbox-inner")
+            if await visual.count() != 1:
+                raise RuntimeError("商家搬家承诺书没有唯一可见点击入口")
+            await visual.click(timeout=5_000)
+        deadline = monotonic() + 10
+        while monotonic() < deadline:
+            await self.accept_service_agreement()
+            await self.accept_copy_commitment()
+            if await checkbox.is_checked():
+                return
+            await self.page.wait_for_timeout(100)
+        raise RuntimeError("商家搬家承诺书确认失败：协议处理后仍未勾选，请查看失败截图")
+
+    async def accept_copy_commitment(self) -> bool:
+        """处理已识别的商品复制承诺书，内容只取当前弹窗显示的模板。"""
+        handled = False
+        for frame in self.page.frames:
+            for title in await frame.get_by_text("商品复制承诺书", exact=True).all():
+                if not await title.is_visible():
+                    continue
+                modal = title.locator(
+                    "xpath=ancestor::*[.//textarea[@placeholder='请输入承诺内容']][1]"
+                )
+                field = modal.get_by_placeholder("请输入承诺内容", exact=True)
+                button = modal.get_by_role("button", name="确认签署并继续", exact=True)
+                if await field.count() != 1 or await button.count() != 1:
+                    raise RuntimeError("商品复制承诺书结构不明确，停止提交")
+                text = await modal.inner_text()
+                match = re.search(
+                    r"本店承诺在进行商品复制时[\s\S]*?本店将自行承担相应责任[。.]?", text,
+                )
+                if match is None:
+                    raise RuntimeError("未识别到页面展示的承诺内容，请人工核对商品复制承诺书")
+                template = match.group(0).strip()
+                current = await field.input_value()
+                if re.sub(r"\s+", "", current) != re.sub(r"\s+", "", template):
+                    await field.fill(template)
+                await expect(button).to_be_enabled(timeout=5_000)
+                await button.click(timeout=5_000)
+                await expect(title).to_be_hidden(timeout=10_000)
+                handled = True
+        return handled
 
     async def start_upload(self) -> None:
+        await self.accept_service_agreement()
+        await self.accept_copy_commitment()
+        await self.verify_shop_selection()
+        commitment = await self._commitment_checkbox()
+        if commitment is not None and not await commitment.is_checked():
+            raise RuntimeError("商家搬家承诺书尚未确认，停止提交")
         dialog = self.store_dialog()
         button = dialog.get_by_role("button", name="开始上传")
         if await button.count() != 1:
@@ -186,6 +335,7 @@ class UploadPlatformPage:
             # 点「确认上货」提交任务
             try:
                 if await confirm.count() == 1:
+                    self._feedback_before = set(await self._feedback())
                     try:
                         await confirm.click()
                     except Exception:  # noqa: BLE001 — 提交阶段任何异常均不能盲目重发
@@ -211,10 +361,6 @@ class UploadPlatformPage:
             )
 
         # 点完后检查错误和明确提交提示；仅有页面关闭无法证明已成功。
-        error_keywords = (
-            "重复铺货确认", "授权已过期", "授权过期", "已过期", "已达上限",
-            "达到上限", "操作频繁", "无权限",
-        )
         for _ in range(60):  # 最多 30 秒；超级店长异步提交可能超过 5 秒
             try:
                 success_text = await self._visible_success_text()
@@ -222,17 +368,11 @@ class UploadPlatformPage:
                     self.last_visible_text = success_text
                     self.last_submission_detail = f"页面反馈：{success_text}；仍需核验目标平台是否上架"
                     return ListingStatus.SUBMITTED
-                text = await self._grab_context_text(limit=20_000)
-                self.last_visible_text = text
+            except UploadRejectedError:
+                raise
             except Exception as exc:  # noqa: BLE001 — 提交后的读取异常只能视为结果未知
                 self.last_submission_detail = f"读取提交反馈时异常：{type(exc).__name__}: {exc}"
                 return ListingStatus.UNCERTAIN
-            for keyword in error_keywords:
-                if keyword in text:
-                    raise UploadRejectedError(f"确认上货后页面拒绝提交（「{keyword}」）：{text[:200]}")
-            if any(keyword in text for keyword in ("提交成功", "任务创建成功", "上传成功", "上货成功")):
-                self.last_submission_detail = "页面显示明确提交成功提示，仍需核验目标平台是否上架"
-                return ListingStatus.SUBMITTED
             try:
                 await self.page.wait_for_timeout(500)
             except Exception as exc:
@@ -241,4 +381,5 @@ class UploadPlatformPage:
                     return ListingStatus.UNCERTAIN
                 raise
         self.last_submission_detail = "点击确认上货后等待 30 秒，未检测到明确提交提示"
+        self.last_visible_text = await self._grab_context_text(limit=2_000)
         return ListingStatus.UNCERTAIN

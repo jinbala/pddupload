@@ -61,12 +61,14 @@ def export_workbook_xlsx(
         ws = wb.create_sheet(title=sheet_name[:31])
         if not rows:
             continue
-        fieldnames = list(rows[0].keys())
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
         ws.append(fieldnames)
+        ws.freeze_panes = "A2"
         for cell in ws[1]:
             cell.font = Font(bold=True)
         for row in rows:
             ws.append([row.get(k, "") for k in fieldnames])
+        ws.auto_filter.ref = ws.dimensions
         for idx, key in enumerate(fieldnames, 1):
             width = max(len(str(key)), *(len(str(r.get(key, ""))) for r in rows[:500]))
             ws.column_dimensions[get_column_letter(idx)].width = min(max(width + 2, 8), 50)

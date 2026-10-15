@@ -5,6 +5,7 @@ import re
 from playwright.async_api import Locator, Page
 
 from pdd_listing_automation.models import ShopNewArrival
+from pdd_listing_automation.pages.waits import list_signature, wait_for_list
 
 FAVORITE_SHOPS_URL = "https://i.17zwd.com/user/favouriteShops"
 
@@ -87,7 +88,7 @@ class FavoriteShopsPage:
 
     async def collect_current_page(self) -> list[ShopNewArrival]:
         # 页面内容由 JS 异步渲染，先等第一个上新款链接出现再采集。
-        await self.page.locator("a[href*='/item/']").first.wait_for(timeout=15_000)
+        await wait_for_list(self.page, "a[href*='/item/']")
         raw_cards = await self.page.evaluate(_EXTRACT_CARDS_JS)
         arrivals: list[ShopNewArrival] = []
         for raw in raw_cards:
@@ -119,5 +120,6 @@ class FavoriteShopsPage:
     async def go_to_next_page(self) -> None:
         if not await self.has_next_page():
             raise RuntimeError("没有可用的下一页")
+        previous = await list_signature(self.page, "a[href*='/item/']")
         await self.next_page_locator().locator("button").click()
-        await self.page.wait_for_timeout(700)
+        await wait_for_list(self.page, "a[href*='/item/']", previous)

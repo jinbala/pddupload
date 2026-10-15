@@ -22,16 +22,25 @@ class SourceProductRepository:
         ).fetchall()
         return {row["source_goods_id"] for row in rows if row["source_goods_id"]}
 
+    def listed_product_keys(self, platform: Platform, target_shop: str = "") -> set[tuple[str, str]]:
+        query = "SELECT source_market, source_goods_id FROM source_products WHERE source_platform = ?"
+        params = [platform.value]
+        if target_shop:
+            query += " AND (target_shop = ? OR target_shop = '')"
+            params.append(target_shop)
+        return {(row[0], row[1]) for row in self.connection.execute(query, params) if row[1]}
+
     def find_listing_record(
-        self, platform: Platform, target_shop: str, goods_id: str,
+        self, platform: Platform, target_shop: str, goods_id: str, source_market: str = "",
     ) -> sqlite3.Row | None:
         """返回拦截依据，优先匹配目标店铺，其次是店铺未知的历史记录。"""
         return self.connection.execute(
-            "SELECT target_shop, listing_status FROM source_products "
+            "SELECT target_shop, listing_status, source_market FROM source_products "
             "WHERE source_platform = ? AND source_goods_id = ? "
             "AND (target_shop = ? OR target_shop = '') "
+            "AND (source_market = ? OR source_market = '' OR ? = '') "
             "ORDER BY (target_shop = ?) DESC LIMIT 1",
-            (platform.value, goods_id, target_shop, target_shop),
+            (platform.value, goods_id, target_shop, source_market, source_market, target_shop),
         ).fetchone()
 
     def upsert_many(self, products: Iterable[SourceProduct]) -> int:
@@ -52,6 +61,8 @@ class SourceProductRepository:
                 product.collected_at.isoformat(),
                 product.target_shop,
                 product.listing_status.value,
+                product.source_market,
+                product.source_url,
             )
             for product in products
         ]
@@ -73,8 +84,8 @@ class SourceProductRepository:
                     find_similar_url,
                     source_platform,
                     uploaded_at_text,
-                    collected_at, target_shop, listing_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    collected_at, target_shop, listing_status, source_market, source_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(identity_key) DO UPDATE SET
                     source_goods_id = excluded.source_goods_id,
                     source_row_key = excluded.source_row_key,
@@ -88,6 +99,7 @@ class SourceProductRepository:
                     source_platform = excluded.source_platform,
                     uploaded_at_text = excluded.uploaded_at_text,
                     collected_at = excluded.collected_at,
+                    source_url = COALESCE(NULLIF(excluded.source_url, ''), source_products.source_url),
                     listing_status = excluded.listing_status
                 """,
                 rows,
@@ -101,6 +113,7 @@ class SourceProductRepository:
     def resolve_submission(
         self, platform: Platform, target_shop: str, goods_id: str, *, recorded: bool,
         include_recorded: bool = False,
+        source_market: str | None = None,
     ) -> bool:
         """用户核对日志后，只处理指定店铺的待核实/已提交记录。"""
         statuses = [ListingStatus.UNCERTAIN.value, ListingStatus.SUBMITTED.value]
@@ -111,6 +124,15 @@ class SourceProductRepository:
             f"AND listing_status IN ({','.join('?' for _ in statuses)})"
         )
         params = (platform.value, target_shop, goods_id, *statuses)
+        if source_market is not None:
+            condition += " AND source_market = ?"
+            params += (source_market,)
+        else:
+            markets = self.connection.execute(
+                "SELECT DISTINCT source_market FROM source_products " + condition, params,
+            ).fetchall()
+            if len(markets) > 1:
+                raise ValueError("该商品 ID 存在多个来源站点，请传入商品完整链接或 --source-market")
         with self.connection:
             if recorded:
                 cursor = self.connection.execute(

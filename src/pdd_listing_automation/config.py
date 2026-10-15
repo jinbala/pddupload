@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def _load_dotenv(directory: Path) -> None:
@@ -34,8 +34,8 @@ class Settings(BaseModel):
     artifacts_dir: Path
     database_path: Path
     headless: bool = False
-    slow_mo_ms: int = 0
-    login_wait_seconds: int = 300
+    slow_mo_ms: int = Field(default=0, ge=0)
+    login_wait_seconds: int = Field(default=300, ge=0)
 
     @classmethod
     def from_environment(cls) -> Settings:

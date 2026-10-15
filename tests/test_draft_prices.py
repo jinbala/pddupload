@@ -53,8 +53,10 @@ def test_price_editing_in_local_browser():
 def test_draft_submit_does_not_retry_when_result_is_unknown():
     page = MagicMock()
     page.get_by_text.return_value.count = AsyncMock(return_value=0)
+    page.get_by_text.return_value.first.is_visible = AsyncMock(return_value=False)
     page.get_by_role.return_value.click = AsyncMock()
     page.locator.return_value.inner_text = AsyncMock(return_value="处理中")
+    page.locator.return_value.evaluate = AsyncMock(return_value=[])
     page.wait_for_timeout = AsyncMock()
     page.url = "https://mms.pinduoduo.com/goods/goods_add"
     assert asyncio.run(PddDraftPage(page).submit_and_wait(page)) == "uncertain"
@@ -64,6 +66,8 @@ def test_draft_submit_does_not_retry_when_result_is_unknown():
 def test_draft_submit_requires_explicit_success():
     page = MagicMock()
     page.get_by_text.return_value.count = AsyncMock(return_value=0)
+    page.get_by_text.return_value.first.is_visible = AsyncMock(return_value=False)
     page.get_by_role.return_value.click = AsyncMock()
     page.locator.return_value.inner_text = AsyncMock(return_value="发布成功")
+    page.locator.return_value.evaluate = AsyncMock(side_effect=[[], ["发布成功"]])
     assert asyncio.run(PddDraftPage(page).submit_and_wait(page)) == "success"

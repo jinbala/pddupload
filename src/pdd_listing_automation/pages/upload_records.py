@@ -6,6 +6,7 @@ from playwright.async_api import Locator, Page
 from pydantic import ValidationError
 
 from pdd_listing_automation.models import Platform, SourceProduct
+from pdd_listing_automation.pages.waits import list_signature, wait_for_list
 
 UPLOAD_RECORD_URL = "https://i.17zwd.com/user/uploadRecord"
 
@@ -40,8 +41,13 @@ class UploadRecordsPage:
         tab = self.page.get_by_role("tab", name=platform.upload_record_tab_name)
         if await tab.count() != 1:
             raise RuntimeError(f"平台标签定位失败：{platform.display_name}")
+        selector = "table tbody tr[data-row-key]"
+        if await tab.get_attribute("aria-selected") == "true":
+            await wait_for_list(self.page, selector)
+            return
+        previous = await list_signature(self.page, selector)
         await tab.click()
-        await self.page.wait_for_timeout(500)
+        await wait_for_list(self.page, selector, previous)
 
     async def collect_current_page(self, platform: Platform) -> list[SourceProduct]:
         rows = self.page.locator("table tbody tr[data-row-key]")
@@ -98,6 +104,7 @@ class UploadRecordsPage:
     async def go_to_next_page(self) -> None:
         if not await self.has_next_page():
             raise RuntimeError("没有可用的下一页")
+        previous = await list_signature(self.page, "table tbody tr[data-row-key]")
         # 等加载遮罩消失，避免点击被拦截或按钮在点击过程中变禁用
         with suppress(Exception):
             await self.page.locator(".ant-spin-spinning").first.wait_for(
@@ -109,4 +116,4 @@ class UploadRecordsPage:
             await self.next_page_button().click(timeout=10_000)
         except Exception as exc:
             raise RuntimeError("没有可用的下一页") from exc
-        await self.page.wait_for_timeout(700)
+        await wait_for_list(self.page, "table tbody tr[data-row-key]", previous)

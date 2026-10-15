@@ -5,6 +5,8 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from playwright.async_api import Page
 
+from pdd_listing_automation.pages.feedback import SUCCESS, visible_feedback
+
 DRAFT_BOX_URL = "https://mms.pinduoduo.com/goods/goods_list?activeKeyNew=key_7"
 
 # 只识别规格表格中的价格列，不按页面上数字输入框的排列猜测字段。
@@ -47,7 +49,22 @@ class PddDraftPage:
     async def open_draft_box(self) -> None:
         await self.page.goto(DRAFT_BOX_URL, wait_until="domcontentloaded")
         await self.page.get_by_text("草稿箱", exact=False).first.wait_for(timeout=20_000)
-        await self.page.wait_for_timeout(3_000)
+        await self.page.wait_for_function(r"""() => {
+            const text = document.body.innerText;
+            return /商品编码[：:]\s*\d+|暂无数据|暂无商品|暂无草稿/.test(text)
+                && ![...document.querySelectorAll('.ant-spin-spinning')].some(el => el.getClientRects().length);
+        }""", timeout=20_000)
+
+    async def verify_shop(self, shop_name: str) -> None:
+        matches = self.page.get_by_text(shop_name, exact=True)
+        if await matches.count() != 1 or not await matches.is_visible():
+            raise RuntimeError("无法唯一核对当前拼多多店铺名称，停止草稿发布")
+
+    async def wait_price_fields(self, edit_page: Page) -> None:
+        await edit_page.wait_for_function(
+            "() => { const result = (" + PRICE_FIELDS_JS + ")(); return result.error || result.rows.length > 0; }",
+            timeout=20_000,
+        )
 
     async def collect_skus(self) -> list[str]:
         """收集草稿箱里的商品编码（= 17zwd 商品 ID），按列表顺序去重。"""
@@ -125,18 +142,19 @@ class PddDraftPage:
     async def submit_and_wait(self, edit_page: Page) -> str:
         """只提交一次；超时、跳转或验证码后无明确结果时返回待核实。"""
         try:
-            if await edit_page.get_by_text("请向右滑块完成拼图", exact=False).count():
+            if await edit_page.get_by_text("请向右滑块完成拼图", exact=False).first.is_visible():
                 print("    ⚠ 请在弹出的浏览器里手动拖滑块完成验证……")
                 if not await self._wait_slider_gone(edit_page):
                     return "uncertain"
+            before = set(await visible_feedback(edit_page))
             await edit_page.get_by_role("button", name="提交并上架").click(timeout=8_000)
             for _ in range(120):
-                if await edit_page.get_by_text("请向右滑块完成拼图", exact=False).count():
+                if await edit_page.get_by_text("请向右滑块完成拼图", exact=False).first.is_visible():
                     print("    ⚠ 请在弹出的浏览器里手动拖滑块完成验证……")
                     if not await self._wait_slider_gone(edit_page):
                         return "uncertain"
-                text = await edit_page.locator("body").inner_text()
-                if any(k in text for k in ("提交成功", "上架成功", "发布成功", "已提交")):
+                feedback = set(await visible_feedback(edit_page)) - before
+                if any(SUCCESS.fullmatch(text) for text in feedback):
                     return "success"
                 if "goods_list" in edit_page.url:
                     return "uncertain"
@@ -147,7 +165,7 @@ class PddDraftPage:
 
     async def _wait_slider_gone(self, edit_page: Page) -> bool:
         for _ in range(180):  # 最多等 3 分钟人工拖
-            if not await edit_page.get_by_text("请向右滑块完成拼图", exact=False).count():
+            if not await edit_page.get_by_text("请向右滑块完成拼图", exact=False).first.is_visible():
                 await edit_page.wait_for_timeout(1_000)
                 return True
             await edit_page.wait_for_timeout(1_000)

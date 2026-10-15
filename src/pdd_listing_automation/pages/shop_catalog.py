@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from playwright.async_api import Page
 
 from pdd_listing_automation.models import ShopNewArrival
+from pdd_listing_automation.pages.waits import list_signature, wait_for_list
 
 # 档口「在售商品」全量列表：每个商品是一个 <a href*='/item/'>，商品卡片是其最近的
 # [class*=goodsItem] 祖先；标题在图片 title 属性，价格/上新日期在卡片文本。
@@ -68,7 +69,7 @@ class ShopCatalogPage:
     async def open(self, url: str, start_page: int = 1) -> None:
         self.base_url = _normalize_shop_url(url)  # 始终从 page=1 开始
         await self.page.goto(self.base_url, wait_until="domcontentloaded")
-        await self.page.locator("a[href*='/item/']").first.wait_for(timeout=20_000)
+        await wait_for_list(self.page, "a[href*='/item/']")
         self.shop_name = await self.page.evaluate(_EXTRACT_SHOP_NAME_JS)
         # 从第 1 页用「下一页」按钮逐页前进到起始页（URL 直接跳转会漏加载）
         for _ in range(max(0, start_page - 1)):
@@ -88,8 +89,9 @@ class ShopCatalogPage:
             raise RuntimeError("分页组件定位失败")
         if await pager_next.evaluate("el => el.classList.contains('ant-pagination-disabled')"):
             raise RuntimeError("已经是最后一页")
+        previous = await list_signature(self.page, "a[href*='/item/']")
         await pager_next.locator("button").click()
-        await self.page.wait_for_timeout(1500)
+        await wait_for_list(self.page, "a[href*='/item/']", previous)
 
     async def has_next_page(self) -> bool:
         pager_next = self.page.locator("li.ant-pagination-next")

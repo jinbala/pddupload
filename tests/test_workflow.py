@@ -36,10 +36,15 @@ def test_batch_records_submission_states_and_continues_on_uncertain(settings, mo
         target_shop="目标店", confirm_publish="" if status == "prepared" else "PUBLISH",
         item_ids="1,2", limit=0, delay_seconds=0, hold_open_seconds=0,
     )
-    upload = AsyncMock(return_value=(
-        {"title": "详情标题", "sku": "ABC", "price": "22", "screenshot_path": "test.png",
-         "listing_status": status}, None, status != "prepared",
-    ))
+    async def fake_upload(page, **kwargs):
+        result = {"title": "详情标题", "sku": "ABC", "price": "22", "screenshot_path": "test.png",
+                  "listing_status": status}
+        # 单品服务负责提交记录；批次层只记录进度，不再重复写同一条记录。
+        if status != "prepared":
+            app._mark_listed(settings, kwargs["source_arrival"], Platform.PINDUODUO,
+                             kwargs["target_shop"], result, ListingStatus(status))
+        return result, None, status != "prepared"
+    upload = AsyncMock(side_effect=fake_upload)
     monkeypatch.setattr(app, "run_single_upload", upload)
     exports = []
     monkeypatch.setattr(app, "export_workbook_xlsx", lambda sheets, *args: exports.extend(sheets))
@@ -80,7 +85,7 @@ def test_confirmation_requires_positive_evidence(text, expected):
     page.wait_for_timeout = AsyncMock()
     platform = UploadPlatformPage(page)
     platform._grab_context_text = AsyncMock(return_value=text)
-    platform._visible_success_text = AsyncMock(return_value="")
+    platform._visible_success_text = AsyncMock(return_value=text if text == "提交成功" else "")
     assert asyncio.run(platform.confirm_listing()) == expected
 
 
@@ -115,7 +120,7 @@ def test_interrupted_submission_blocks_retry_but_explicit_rejection_does_not(set
     monkeypatch.setattr(app, "ProductDetailPage", lambda page: product)
     platform = MagicMock()
     for name in ("confirm_superboss", "wait_for_store_selection", "select_shop",
-                 "accept_commitment", "start_upload"):
+                 "accept_service_agreement", "accept_copy_commitment", "accept_commitment", "start_upload"):
         setattr(platform, name, AsyncMock())
     platform.confirm_listing = AsyncMock(side_effect=(
         UploadRejectedError("授权已过期") if rejected else RuntimeError("interrupted")
@@ -179,11 +184,10 @@ def test_submission_can_finish_after_original_five_second_window():
     frame.get_by_role.return_value.click = AsyncMock()
     page.wait_for_timeout = AsyncMock()
     platform = UploadPlatformPage(page)
-    platform._visible_success_text = AsyncMock(return_value="")
-    platform._grab_context_text = AsyncMock(side_effect=["正在处理"] * 12 + ["提交成功"])
+    platform._visible_success_text = AsyncMock(side_effect=[""] * 12 + ["提交成功"])
     assert asyncio.run(platform.confirm_listing()) == ListingStatus.SUBMITTED
     assert frame.get_by_role.return_value.click.await_count == 1
-    assert platform._grab_context_text.await_count == 13
+    assert platform._visible_success_text.await_count == 13
 
 
 def test_visible_outer_feedback_is_detected_beyond_long_iframe_form():

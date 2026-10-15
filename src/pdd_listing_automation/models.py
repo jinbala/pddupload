@@ -1,10 +1,41 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from enum import StrEnum
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def market_from_url(url: str) -> str:
+    """只从商品详情链接识别市场，搜索/图片域名不能代表货源站点。"""
+    parsed = urlparse(url)
+    return (parsed.hostname or "").lower() if parsed.path.startswith("/item/") else ""
+
+
+def arrival_sort_key(text: str, today: date | None = None) -> tuple[int, int]:
+    today = today or datetime.now(timezone(timedelta(hours=8))).date()
+    try:
+        if len(text.split("-")) == 3:
+            value = date.fromisoformat(text)
+        else:
+            month, day = map(int, text.split("-"))
+            # 包含闰日；取不晚于今天的最近一次日期。
+            value = None
+            for year in range(today.year, today.year - 5, -1):
+                try:
+                    candidate = date(year, month, day)
+                except ValueError:
+                    continue
+                if candidate <= today:
+                    value = candidate
+                    break
+            if value is None:
+                return (0, 0)
+        return (value.year, value.toordinal())
+    except (ValueError, TypeError):
+        return (0, 0)
 
 
 class Platform(StrEnum):
@@ -67,6 +98,8 @@ class SourceProduct(BaseModel):
     source_category: str = ""
     image_url: str = ""
     find_similar_url: str = ""
+    source_market: str = ""
+    source_url: str = ""
     source_platform: Platform
     target_shop: str = ""
     listing_status: ListingStatus = ListingStatus.RECORDED
@@ -85,11 +118,18 @@ class SourceProduct(BaseModel):
         "find_similar_url",
         "uploaded_at_text",
         "target_shop",
+        "source_market",
+        "source_url",
         mode="before",
     )
     @classmethod
     def normalize_text(cls, value: object) -> str:
         return "" if value is None else str(value).strip()
+
+    @model_validator(mode="after")
+    def normalize_market(self):
+        self.source_market = self.source_market.lower() or market_from_url(self.source_url)
+        return self
 
     @property
     def identity(self) -> str:
@@ -98,7 +138,7 @@ class SourceProduct(BaseModel):
     @property
     def storage_key(self) -> str:
         return json.dumps(
-            [self.source_platform.value, self.target_shop, self.identity],
+            [self.source_platform.value, self.target_shop, self.source_market, self.identity],
             ensure_ascii=False, separators=(",", ":"),
         )
 
@@ -159,10 +199,19 @@ class ShopNewArrival(BaseModel):
         return "" if value is None else str(value).strip()
 
     @property
+    def source_market(self) -> str:
+        return market_from_url(self.item_url)
+
+    @property
+    def product_key(self) -> tuple[str, str]:
+        return (self.source_market, self.item_id)
+
+    @property
     def on_shelf_sort_key(self) -> tuple[int, int]:
-        """把“MM-DD”上新日期转成可排序的 (月, 日)。跨年场景按简单启发处理。"""
-        if "-" in self.on_shelf_date_text:
-            month, _, day = self.on_shelf_date_text.partition("-")
-            if month.isdigit() and day.isdigit():
-                return (int(month), int(day))
-        return (0, 0)
+        return arrival_sort_key(self.on_shelf_date_text)
+
+
+def has_listing(arrival: ShopNewArrival, keys: set) -> bool:
+    # 未知站点的历史数据保持保守拦截；兼容旧调用传入的纯 ID 集合。
+    return (arrival.product_key in keys or ("", arrival.item_id) in keys
+            or arrival.item_id in keys)
