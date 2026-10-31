@@ -41,6 +41,25 @@ class UploadPlatformPage:
         # 一个 frame 一次浏览器调用，避免按节点往返读取。
         for frame in self.page.frames:
             result.extend(await visible_feedback(frame))
+            # 实机反馈是带两个后续操作入口的“开始上货任务”窗口。
+            # 必须核对同一可见窗口，不能把页面说明或隐藏模板当成成功。
+            for title in await frame.get_by_text("开始上货任务", exact=True).all():
+                if not await title.is_visible():
+                    continue
+                modal = title.locator(
+                    "xpath=ancestor::*[not(self::body or self::html)]"
+                    "[.//*[self::button or self::a or @role='button']"
+                    "[normalize-space()='继续上货'] and "
+                    ".//*[self::button or self::a or @role='button']"
+                    "[normalize-space()='查看上货记录']][1]"
+                )
+                if await modal.count() != 1:
+                    continue
+                controls = [modal.get_by_text(label, exact=True)
+                            for label in ("继续上货", "查看上货记录")]
+                if all([await field.count() == 1 and await field.is_visible()
+                        for field in controls]):
+                    result.append("开始上货任务")
         return result
 
     def store_dialog(self):
@@ -304,6 +323,31 @@ class UploadPlatformPage:
         with suppress(Exception):
             await self.page.wait_for_timeout(5_000)
 
+    async def _reject_duplicate(self, primary) -> None:
+        """检查内外层所有可见重复提示，只在同一弹窗内取消，绝不确认重发。"""
+        roots = [primary, *self.page.frames]
+        for root in roots:
+            for title in await root.get_by_text("重复铺货确认", exact=False).all():
+                if not await title.is_visible():
+                    continue
+                modal = title.locator(
+                    "xpath=ancestor-or-self::*[not(self::body or self::html)]"
+                    "[.//*[self::button or @role='button']"
+                    "[translate(normalize-space(), ' ', '')='取消' or "
+                    "normalize-space()='取消本次操作']][1]"
+                )
+                cancel = modal.get_by_role(
+                    "button", name=re.compile(r"^\s*(?:取\s*消|取消本次操作)\s*$"),
+                )
+                cancelled = False
+                for button in await cancel.all():
+                    if await button.is_visible() and await button.is_enabled():
+                        await button.click(timeout=5_000)
+                        cancelled = True
+                        break
+                action = "已取消本次操作" if cancelled else "停止本次操作，未确认重复铺货"
+                raise AlreadyListedError(f"上传页面显示可见的「重复铺货确认」，{action}")
+
     async def confirm_listing(self) -> ListingStatus:
         """点「确认上货」提交任务。
 
@@ -317,21 +361,11 @@ class UploadPlatformPage:
         for _ in range(60):
             # 已存在代销关系：弹「重复铺货确认」，点取消跳过（弹窗可能稍后才出现，所以每轮都查）
             try:
-                duplicate = await frame.get_by_text("重复铺货确认", exact=False).first.is_visible()
+                await self._reject_duplicate(frame)
             except Exception as exc:
                 if _is_closed_error(exc):
                     raise RuntimeError("等待确认上货时页面被关闭，上货未完成")
                 raise
-            if duplicate:
-                for name in ("取 消", "取消", "取消本次操作"):
-                    cancel = frame.get_by_role("button", name=name)
-                    if await cancel.count():
-                        await cancel.first.click()
-                        with suppress(Exception):
-                            await self.page.wait_for_timeout(1_000)
-                        break
-                raise AlreadyListedError("上传页面显示可见的「重复铺货确认」，已取消本次操作")
-
             # 点「确认上货」提交任务
             try:
                 if await confirm.count() == 1:
@@ -361,14 +395,15 @@ class UploadPlatformPage:
             )
 
         # 点完后检查错误和明确提交提示；仅有页面关闭无法证明已成功。
-        for _ in range(60):  # 最多 30 秒；超级店长异步提交可能超过 5 秒
+        for _ in range(10):  # 每 500 毫秒检查一次，轮询等待约 5 秒
             try:
+                await self._reject_duplicate(frame)
                 success_text = await self._visible_success_text()
                 if success_text:
                     self.last_visible_text = success_text
                     self.last_submission_detail = f"页面反馈：{success_text}；仍需核验目标平台是否上架"
                     return ListingStatus.SUBMITTED
-            except UploadRejectedError:
+            except (AlreadyListedError, UploadRejectedError):
                 raise
             except Exception as exc:  # noqa: BLE001 — 提交后的读取异常只能视为结果未知
                 self.last_submission_detail = f"读取提交反馈时异常：{type(exc).__name__}: {exc}"
@@ -380,6 +415,6 @@ class UploadPlatformPage:
                     self.last_submission_detail = "点击确认上货后页面关闭，未读取到明确结果；需核对上货日志"
                     return ListingStatus.UNCERTAIN
                 raise
-        self.last_submission_detail = "点击确认上货后等待 30 秒，未检测到明确提交提示"
+        self.last_submission_detail = "点击确认上货后等待 5 秒，未检测到明确提交提示"
         self.last_visible_text = await self._grab_context_text(limit=2_000)
         return ListingStatus.UNCERTAIN

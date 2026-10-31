@@ -5,6 +5,13 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# 源码运行使用项目目录；安装为普通包时使用固定用户目录，均不依赖启动位置。
+_PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_ROOT_DIR = (
+    _PACKAGE_DIR.parent.parent if _PACKAGE_DIR.parent.name == "src"
+    else Path.home() / ".pdd-listing-automation"
+)
+
 
 def _load_dotenv(directory: Path) -> None:
     """极简 .env 加载（不依赖 python-dotenv）：只读 KEY=VALUE 行，不覆盖已存在的环境变量。
@@ -39,9 +46,14 @@ class Settings(BaseModel):
 
     @classmethod
     def from_environment(cls) -> Settings:
-        cwd = Path.cwd()
-        _load_dotenv(cwd)
-        root_dir = Path(os.getenv("PDD_AUTOMATION_HOME", cwd)).resolve()
+        _load_dotenv(DEFAULT_ROOT_DIR)
+        configured_home = os.getenv("PDD_AUTOMATION_HOME", "").strip()
+        root_dir = Path(configured_home).expanduser() if configured_home else DEFAULT_ROOT_DIR
+        if not root_dir.is_absolute():
+            root_dir = DEFAULT_ROOT_DIR / root_dir
+        root_dir = root_dir.resolve()
+        if root_dir != DEFAULT_ROOT_DIR:
+            _load_dotenv(root_dir)
         data_dir = root_dir / "data"
         artifacts_dir = root_dir / "artifacts"
         return cls(

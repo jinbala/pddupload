@@ -2,7 +2,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
-    echo 未检测到运行环境，请先双击「安装环境.bat」完成初始化。
+    echo 未找到项目运行环境：.venv\Scripts\python.exe，请检查 .venv 目录是否完整。
     pause
     exit /b 1
 )

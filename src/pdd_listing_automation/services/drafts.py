@@ -55,6 +55,8 @@ async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
         raise RuntimeError("草稿箱需要处理人工验证码，请设置 PDD_AUTOMATION_HEADLESS=false")
     if not args.target_shop.strip():
         raise ValueError("草稿发布必须指定 --target-shop，以核对店铺及保存发布记录")
+    args.target_shop = args.target_shop.strip()
+    args.source_market = args.source_market.strip().lower()
     prices = load_source_prices(settings, args.target_shop, args.source_market)
     ledger = DraftLedger(settings.database_path, args.target_shop, args.source_market)
     stem = "drafts-" + datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
@@ -94,7 +96,11 @@ async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
                     await draft.set_prices(edit_page, prices[sku], multiple)
                     await draft.verify_shop(args.target_shop)
                     # 写入提交意图后才允许点击；异常退出也会拦截下次重发。
-                    ledger.save(sku, "uncertain", "已进入草稿提交阶段")
+                    previous = ledger.reserve(sku)
+                    if previous:
+                        row.update(状态="跳过", 原因=f"提交前防重拦截：{previous}，请先核对")
+                        failures += previous == "uncertain"
+                        continue
                     attempted = True
                     status = await draft.submit_and_wait(edit_page)
                     ledger.save(sku, "submitted" if status == "success" else "uncertain")

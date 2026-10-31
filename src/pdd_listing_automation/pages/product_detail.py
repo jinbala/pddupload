@@ -51,13 +51,14 @@ class ProductDetailPage:
         except Exception as exc:
             raise RuntimeError(f"{platform.display_name}平台选项未显示") from exc
         context = self.page.context
+        previous_pages = set(context.pages)
         await platform_choice.first.click()
 
         for _ in range(50):
             # 点击平台后可能直接进 /main/publish（已记住默认应用），也可能先进 /platform
             # 选择应用；两者都在 t-onekey.17zwd.com 上，统一在这里兜住。
             for candidate in context.pages:
-                if "t-onekey.17zwd.com" in (candidate.url or ""):
+                if candidate not in previous_pages and "t-onekey.17zwd.com" in (candidate.url or ""):
                     await candidate.wait_for_load_state("domcontentloaded")
                     return candidate
             if "t-onekey.17zwd.com" in (self.page.url or ""):

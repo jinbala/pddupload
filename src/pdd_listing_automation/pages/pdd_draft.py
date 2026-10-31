@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from contextlib import suppress
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from playwright.async_api import Page
 
@@ -88,11 +89,18 @@ class PddDraftPage:
 
     async def edit_draft(self, sku: str) -> Page | None:
         """点商品编码=sku 的草稿的「编辑」，返回新打开的编辑页标签。"""
-        marker = self.page.get_by_text(f"商品编码：{sku}", exact=False).first
-        if await marker.count() != 1:
+        if not re.fullmatch(r"\d+", sku):
+            raise ValueError("草稿商品编码必须为数字")
+        marker = self.page.get_by_text(re.compile(rf"^\s*商品编码\s*[：:]\s*{re.escape(sku)}\s*$"))
+        count = await marker.count()
+        if count == 0:
             return None
+        if count != 1:
+            raise RuntimeError(f"草稿商品编码 {sku} 匹配到多条记录，停止编辑")
         row = marker.locator("xpath=ancestor::*[.//a[normalize-space()='编辑']][1]")
-        edit = row.locator("a", has_text="编辑").first
+        edit = row.get_by_role("link", name="编辑", exact=True)
+        if await edit.count() != 1:
+            raise RuntimeError(f"草稿商品编码 {sku} 的编辑入口不唯一，停止编辑")
         context = self.page.context
         before = set(context.pages)
         await edit.click()
@@ -116,7 +124,7 @@ class PddDraftPage:
         return result["rows"]
 
     async def set_prices(self, edit_page: Page, source_price: float, multiple: float) -> None:
-        """改所有规格价格：拼单价=货源价×倍数，单买价保持原差额。"""
+        """最低拼单价=货源价×倍数，其余规格和单买价保留原来的金额差。"""
         price, factor = Decimal(str(source_price)), Decimal(str(multiple))
         if not all(v.is_finite() and v > 0 for v in (price, factor)):
             raise ValueError("货源价和售价倍数必须是有限正数")
@@ -124,13 +132,21 @@ class PddDraftPage:
         if target_pin <= 0:
             raise ValueError("计算后的售价必须大于零")
         rows = await self._price_fields(edit_page)
-        changes: list[tuple[int, str]] = []
+        originals: list[tuple[dict, Decimal, Decimal]] = []
         for row in rows:
-            pin, dan = Decimal(row["pin"]), Decimal(row["dan"])
+            try:
+                pin, dan = Decimal(row["pin"]), Decimal(row["dan"])
+            except InvalidOperation as exc:
+                raise RuntimeError("原规格价格无效，停止改价和提交") from exc
             if not all(v.is_finite() and v > 0 for v in (pin, dan)) or dan < pin:
                 raise RuntimeError("原规格价格无效，停止改价和提交")
-            target_dan = (target_pin + dan - pin).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            changes.extend([(row["pin_index"], str(target_pin)), (row["dan_index"], str(target_dan))])
+            originals.append((row, pin, dan))
+        anchor = min(pin for _, pin, _ in originals)
+        changes: list[tuple[int, str]] = []
+        for row, pin, dan in originals:
+            new_pin = (target_pin + pin - anchor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            new_dan = (target_pin + dan - anchor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            changes.extend([(row["pin_index"], str(new_pin)), (row["dan_index"], str(new_dan))])
         # 先验证全部规格，再写入；逐项回读，发现控件拒绝修改时不提交。
         for index, value in changes:
             field = edit_page.locator("input").nth(index)

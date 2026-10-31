@@ -5,7 +5,8 @@ import re
 
 from playwright.async_api import Frame, FrameLocator, Page
 
-SUCCESS = re.compile(r"^(?:提交成功|任务创建成功|上传成功|上货成功|上架成功|发布成功)[！!。\s]*$")
+# “开始上货任务”只由 UploadPlatformPage 校验完整弹窗后加入，不在通用文字扫描中识别。
+SUCCESS = re.compile(r"^(?:提交成功|任务创建成功|上传成功|上货成功|上架成功|发布成功|开始上货任务)[！!。\s]*$")
 REJECTION = re.compile(
     r"^(?:提交失败|上传失败|上货失败|发布失败|未提交成功|授权已过期|授权过期|"
     r"已达上限|达到上限|操作频繁|无权限)(?:$|[！!。，,：:\s])"

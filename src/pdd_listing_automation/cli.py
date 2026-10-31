@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["pinduoduo", "douyin", "拼多多", "抖音"],
         default="pinduoduo",
     )
-    scan.add_argument("--pages", type=nonnegative_int, default=1, help="最多采集多少页")
+    scan.add_argument("--pages", type=nonnegative_int, default=20, help="最多采集多少页，默认 20 页")
     scan.add_argument(
         "--login-wait-seconds",
         type=nonnegative_int,
@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         "publish-drafts",
         help="拼多多后台草稿箱：改价并提交上架（最后一步）",
     )
-    publish.add_argument("--multiple", type=float, default=1.5, help="售价=货源价×倍数（可自定义）")
+    publish.add_argument("--multiple", type=float, default=1.5, help="最低拼单价=货源价×倍数，保留规格价差")
     publish.add_argument("--target-shop", required=True, help="当前拼多多后台的完整店铺名")
     publish.add_argument("--source-market", default="", help="限定成本来源站点，例如 cs.17zwd.com")
     publish.add_argument("--limit", type=nonnegative_int, default=0, help="最多处理多少个草稿，默认全部")

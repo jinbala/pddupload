@@ -244,6 +244,10 @@ async def run_single_upload(
     database_initialized: bool = False,
 ) -> tuple[dict[str, str], Page | None, bool]:
     """单个商品的完整上传流程，停在“选择上货店铺”；确认短语为 PUBLISH 时才点开始上传。"""
+    target_shop = target_shop.strip()
+    parsed_id, _ = parse_item_ref(item_url)
+    if parsed_id != item_id:
+        raise ValueError("商品 ID 与商品链接不一致，停止上传")
     if confirm_publish:
         if confirm_publish != "PUBLISH":
             raise RuntimeError("发布确认短语不正确，必须为 PUBLISH")
@@ -289,7 +293,7 @@ async def run_single_upload(
         await platform_page.accept_commitment()
         # 先落盘再点最终提交：即使进程在点击后退出，下次也不会盲目重发。
         arrival = source_arrival or ShopNewArrival(item_id=item_id, item_url=item_url)
-        _mark_listed(settings, arrival, platform, target_shop, summary, listing_status)
+        _mark_listed(settings, arrival, platform, target_shop, summary, listing_status, reserve=True)
         try:
             await platform_page.start_upload()
             listing_status = await platform_page.confirm_listing()
@@ -464,29 +468,39 @@ def parse_selection(text: str, total: int) -> list[int]:
 def _mark_listed(
     settings: Settings, arrival: ShopNewArrival, platform: Platform,
     target_shop: str, summary: dict[str, str], listing_status: ListingStatus,
+    *, reserve: bool = False,
 ) -> None:
     """记录提交状态和完整货源信息，阻止未经核实的重复提交。"""
     with connect(settings.database_path) as connection:
-        SourceProductRepository(connection).upsert_many(
-            [
-                SourceProduct(
-                    source_goods_id=arrival.item_id,
-                    source_row_key=arrival.item_id,
-                    title=summary.get("title") or arrival.title,
-                    source_sku=summary.get("sku", ""),
-                    price_text=summary.get("price") or arrival.price_text,
-                    source_shop=arrival.shop_name,
-                    source_category=arrival.shop_main_category,
-                    image_url=arrival.image_url,
-                    source_platform=platform,
-                    source_market=arrival.source_market or "gz.17zwd.com",
-                    source_url=arrival.item_url if market_from_url(arrival.item_url) else f"https://gz.17zwd.com/item/{arrival.item_id}",
-                    target_shop=target_shop,
-                    listing_status=listing_status,
-                    uploaded_at_text=datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
-                )
-            ]
+        product = SourceProduct(
+            source_goods_id=arrival.item_id,
+            source_row_key=arrival.item_id,
+            title=summary.get("title") or arrival.title,
+            source_sku=summary.get("sku", ""),
+            price_text=summary.get("price") or arrival.price_text,
+            source_shop=arrival.shop_name,
+            source_category=arrival.shop_main_category,
+            image_url=arrival.image_url,
+            source_platform=platform,
+            source_market=arrival.source_market or "gz.17zwd.com",
+            source_url=(arrival.item_url if market_from_url(arrival.item_url)
+                        else f"https://gz.17zwd.com/item/{arrival.item_id}"),
+            target_shop=target_shop,
+            listing_status=listing_status,
+            uploaded_at_text=datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
         )
+        repo = SourceProductRepository(connection)
+        if reserve:
+            record = repo.reserve_submission(product)
+            if record is not None:
+                label = LISTING_LABELS[ListingStatus(record["listing_status"])]
+                raise AlreadyListedError(
+                    f"提交前防重拦截：{record['target_shop'] or '未知店铺（历史记录）'}，"
+                    f"{label}；请先核对上货日志",
+                    ListingStatus(record["listing_status"]),
+                )
+        else:
+            repo.upsert_many([product])
 
 
 async def _process_arrivals(
@@ -498,6 +512,7 @@ async def _process_arrivals(
     stem_prefix: str,
     label: str,
 ) -> int:
+    args.target_shop = args.target_shop.strip()
     # 去重：同一商品可能出现在多页，只保留一份
     seen: set[tuple[str, str]] = set()
     deduped: list[ShopNewArrival] = []
@@ -928,7 +943,7 @@ def run_menu(settings: Settings) -> int:
         print(f"  每款停顿：{delay} 秒起（随机 {delay}~{delay * 2:.0f} 秒）")
         print("-" * 42)
         print("  1. 看货（扫描关注档口，不上架）")
-        print("  2. 刷新铺货记录（去重）")
+        print("  2. 刷新铺货记录（去重，最多扫描 20 页）")
         print("  3. 上架最新 N 款（真实发布）")
         print("  4. 上架指定商品 ID（真实发布）")
         print("  5. 上架档口老品（贴档口商品页链接）")
@@ -969,7 +984,7 @@ def run_menu(settings: Settings) -> int:
             )
             _run(list_from_shops(args, settings))
         elif choice == "2":
-            args = argparse.Namespace(platform=platform, pages=1, login_wait_seconds=None)
+            args = argparse.Namespace(platform=platform, pages=20, login_wait_seconds=None)
             _run(scan_records(args, settings))
         elif choice == "3":
             if not shop:
@@ -1051,6 +1066,8 @@ def main() -> int:
     args = parser.parse_args()
     settings = Settings.from_environment()
     settings.ensure_directories()
+    print(f"数据目录：{settings.data_dir}")
+    print(f"去重数据库：{settings.database_path}")
 
     if args.command == "init-db":
         initialize(settings.database_path)

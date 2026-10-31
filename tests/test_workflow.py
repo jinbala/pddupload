@@ -83,6 +83,7 @@ def test_confirmation_requires_positive_evidence(text, expected):
     frame.get_by_role.return_value.count = AsyncMock(return_value=1)
     frame.get_by_role.return_value.click = AsyncMock()
     page.wait_for_timeout = AsyncMock()
+    frame.get_by_text.return_value.all = AsyncMock(return_value=[])
     platform = UploadPlatformPage(page)
     platform._grab_context_text = AsyncMock(return_value=text)
     platform._visible_success_text = AsyncMock(return_value=text if text == "提交成功" else "")
@@ -95,6 +96,7 @@ def test_closed_page_during_final_click_is_uncertain():
     frame.get_by_text.return_value.first.is_visible = AsyncMock(return_value=False)
     frame.get_by_role.return_value.count = AsyncMock(return_value=1)
     frame.get_by_role.return_value.click = AsyncMock(side_effect=RuntimeError("TargetClosed"))
+    frame.get_by_text.return_value.all = AsyncMock(return_value=[])
     assert asyncio.run(UploadPlatformPage(page).confirm_listing()) == ListingStatus.UNCERTAIN
 
 
@@ -176,18 +178,27 @@ def test_hidden_duplicate_modal_does_not_skip_but_visible_modal_does():
     asyncio.run(scenario())
 
 
-def test_submission_can_finish_after_original_five_second_window():
+@pytest.mark.parametrize("empty_checks,expected", [
+    (8, ListingStatus.SUBMITTED),
+    (10, ListingStatus.UNCERTAIN),
+])
+def test_submission_waits_up_to_five_seconds(empty_checks, expected):
     page = MagicMock()
     frame = page.frame_locator.return_value.first
     frame.get_by_text.return_value.first.is_visible = AsyncMock(return_value=False)
     frame.get_by_role.return_value.count = AsyncMock(return_value=1)
     frame.get_by_role.return_value.click = AsyncMock()
     page.wait_for_timeout = AsyncMock()
+    frame.get_by_text.return_value.all = AsyncMock(return_value=[])
     platform = UploadPlatformPage(page)
-    platform._visible_success_text = AsyncMock(side_effect=[""] * 12 + ["提交成功"])
-    assert asyncio.run(platform.confirm_listing()) == ListingStatus.SUBMITTED
+    platform._visible_success_text = AsyncMock(side_effect=[""] * empty_checks + ["提交成功"])
+    platform._grab_context_text = AsyncMock(return_value="正在处理")
+    assert asyncio.run(platform.confirm_listing()) == expected
     assert frame.get_by_role.return_value.click.await_count == 1
-    assert platform._visible_success_text.await_count == 13
+    assert platform._visible_success_text.await_count == min(empty_checks + 1, 10)
+    assert page.wait_for_timeout.await_count == empty_checks
+    if expected == ListingStatus.UNCERTAIN:
+        assert "等待 5 秒" in platform.last_submission_detail
 
 
 def test_visible_outer_feedback_is_detected_beyond_long_iframe_form():

@@ -12,6 +12,7 @@ class SourceProductRepository:
 
     def listed_goods_ids(self, platform: Platform, target_shop: str = "") -> set[str]:
         """提交中/待核实也阻止重发；未知店铺的历史记录保守去重。"""
+        target_shop = target_shop.strip()
         query = "SELECT source_goods_id FROM source_products WHERE source_platform = ?"
         params = [platform.value]
         if target_shop:
@@ -23,6 +24,7 @@ class SourceProductRepository:
         return {row["source_goods_id"] for row in rows if row["source_goods_id"]}
 
     def listed_product_keys(self, platform: Platform, target_shop: str = "") -> set[tuple[str, str]]:
+        target_shop = target_shop.strip()
         query = "SELECT source_market, source_goods_id FROM source_products WHERE source_platform = ?"
         params = [platform.value]
         if target_shop:
@@ -34,6 +36,7 @@ class SourceProductRepository:
         self, platform: Platform, target_shop: str, goods_id: str, source_market: str = "",
     ) -> sqlite3.Row | None:
         """返回拦截依据，优先匹配目标店铺，其次是店铺未知的历史记录。"""
+        target_shop = target_shop.strip()
         return self.connection.execute(
             "SELECT target_shop, listing_status, source_market FROM source_products "
             "WHERE source_platform = ? AND source_goods_id = ? "
@@ -42,6 +45,18 @@ class SourceProductRepository:
             "ORDER BY (target_shop = ?) DESC LIMIT 1",
             (platform.value, goods_id, target_shop, source_market, source_market, target_shop),
         ).fetchone()
+
+    def reserve_submission(self, product: SourceProduct) -> sqlite3.Row | None:
+        """在同一个写事务中检查并保存提交意图，避免多个任务同时通过去重。"""
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            record = self.find_listing_record(
+                product.source_platform, product.target_shop,
+                product.source_goods_id, product.source_market,
+            )
+            if record is None:
+                self.upsert_many([product])
+            return record
 
     def upsert_many(self, products: Iterable[SourceProduct]) -> int:
         rows = [

@@ -24,7 +24,28 @@ def test_price_editing_in_local_browser():
                 draft = PddDraftPage(page)
                 await draft.set_prices(page, 20.01, 1.5)
                 values = await page.locator("input").evaluate_all("els => els.map(el => el.value)")
-                assert values == ["123.45", "35.02", "30.02", "100.00", "37.02", "30.02", "200"]
+                assert values == ["123.45", "35.02", "30.02", "100.00", "38.52", "31.52", "200"]
+
+                # 重复运行同一目标价不叠加涨价，调低基准价仍保留规格差额。
+                await draft.set_prices(page, 20.01, 1.5)
+                assert await page.locator("input").evaluate_all("els => els.map(el => el.value)") == values
+                await draft.set_prices(page, 10, 1.5)
+                assert await page.locator("input").evaluate_all("els => els.map(el => el.value)") == [
+                    "123.45", "20.00", "15.00", "100.00", "23.50", "16.50", "200",
+                ]
+
+                # 最低价不在首行时，也以最低规格为基准；同价规格保持同价。
+                await page.set_content('''
+                    <table><thead><tr><th>拼单价</th><th>单买价</th></tr></thead><tbody>
+                    <tr><td><input value="23"></td><td><input value="29"></td></tr>
+                    <tr><td><input value="20"></td><td><input value="25"></td></tr>
+                    <tr><td><input value="20"></td><td><input value="25"></td></tr>
+                    </tbody></table>
+                ''')
+                await draft.set_prices(page, 20, 1.5)
+                assert await page.locator("input").evaluate_all("els => els.map(el => el.value)") == [
+                    "33.00", "39.00", "30.00", "35.00", "30.00", "35.00",
+                ]
 
                 # 缺少明确表头时拒绝改价，不把任意数字输入框当成价格。
                 await page.set_content('<input value="10.00"><input value="20.00">')
