@@ -19,7 +19,7 @@ from pdd_listing_automation.models import (
 )
 from pdd_listing_automation.pages.upload_platform import UploadPlatformPage, UploadRejectedError
 from pdd_listing_automation.pages.waits import list_signature, wait_for_list
-from pdd_listing_automation.services.drafts import load_source_prices
+from pdd_listing_automation.services.drafts import load_source_details, load_source_prices
 from pdd_listing_automation.storage.batches import BatchJournal
 from pdd_listing_automation.storage.database import SCHEMA, connect, initialize
 from pdd_listing_automation.storage.drafts import DraftLedger
@@ -87,6 +87,40 @@ def test_ambiguous_price_is_not_used(settings):
         SourceProductRepository(db).upsert_many([product("gz.17zwd.com"), product("cs.17zwd.com", "30")])
     assert load_source_prices(settings, "店铺") == {}
     assert load_source_prices(settings, "店铺", "cs.17zwd.com") == {"1": 30}
+
+
+def test_source_details_requires_one_source_shop_for_title_cleanup(settings):
+    with connect(settings.database_path) as db:
+        repo = SourceProductRepository(db)
+        repo.upsert_many([
+            product("cs.17zwd.com").model_copy(update={
+                "source_shop": "汇兴达网购_潮汕池尾商圈综合市场N档",
+                "title": "汇兴达【随心裁】上衣女",
+            }),
+        ])
+    details = load_source_details(settings, "店铺", "cs.17zwd.com")
+    assert details["1"]["price"] == 20
+    assert details["1"]["source_shop"] == "汇兴达网购_潮汕池尾商圈综合市场N档"
+    assert details["1"]["source_title"] == "汇兴达【随心裁】上衣女"
+
+    with connect(settings.database_path) as db:
+        SourceProductRepository(db).upsert_many([
+            product("cs.17zwd.com").model_copy(update={
+                "source_shop": "另一个档口", "target_shop": "",
+            }),
+        ])
+    details = load_source_details(settings, "店铺", "cs.17zwd.com")
+    assert details["1"]["source_shop"] == ""
+
+
+def test_source_details_allows_unknown_source_shop_for_price_update(settings):
+    with connect(settings.database_path) as db:
+        SourceProductRepository(db).upsert_many([
+            product("cs.17zwd.com").model_copy(update={"source_shop": "", "target_shop": ""}),
+        ])
+    details = load_source_details(settings, "店铺", "cs.17zwd.com")
+    assert details["1"]["price"] == 20
+    assert details["1"]["source_shop"] == ""
 
 
 def test_selection_normalizes_id_and_url_and_rejects_ambiguous_id():

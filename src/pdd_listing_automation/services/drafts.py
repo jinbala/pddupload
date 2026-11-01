@@ -15,11 +15,15 @@ from pdd_listing_automation.storage.database import connect, initialize
 from pdd_listing_automation.storage.drafts import DraftLedger
 
 
-def load_source_prices(settings: Settings, target_shop: str = "", source_market: str = "") -> dict[str, float]:
-    """同号跨站点或未知来源与已知价格冲突时跳过，避免拿另一款的成本改价。"""
+def load_source_details(
+    settings: Settings, target_shop: str = "", source_market: str = "",
+) -> dict[str, dict[str, float | str]]:
+    """加载可靠货源价及来源档口，来源不明确时不猜测标题前缀。"""
     initialize(settings.database_path)
-    query = ("SELECT source_goods_id, source_market, price_text FROM source_products "
-             "WHERE source_platform='pinduoduo' AND price_text!=''")
+    query = (
+        "SELECT source_goods_id, source_market, price_text, source_shop, title "
+        "FROM source_products WHERE source_platform='pinduoduo' AND price_text!=''"
+    )
     params = []
     if target_shop:
         query += " AND (target_shop=? OR target_shop='')"
@@ -30,21 +34,59 @@ def load_source_prices(settings: Settings, target_shop: str = "", source_market:
     query += " ORDER BY collected_at DESC"
     with connect(settings.database_path) as db:
         rows = db.execute(query, params).fetchall()
-    prices: dict[str, dict[str, float]] = {}
+
+    grouped: dict[str, dict[str, list[dict[str, float | str]]]] = {}
     for row in rows:
         try:
             price = float(row["price_text"].replace("¥", "").replace("￥", "").strip())
-        except ValueError:
+        except (AttributeError, ValueError):
             continue
         if math.isfinite(price) and price > 0:
-            prices.setdefault(row["source_goods_id"], {}).setdefault(row["source_market"], price)
-    result = {}
-    for goods_id, markets in prices.items():
+            grouped.setdefault(row["source_goods_id"], {}).setdefault(
+                row["source_market"], []
+            ).append({
+                "price": price,
+                "source_shop": (row["source_shop"] or "").strip(),
+                "title": (row["title"] or "").strip(),
+            })
+
+    result: dict[str, dict[str, float | str]] = {}
+    for goods_id, markets in grouped.items():
+        market_prices = {
+            market: {item["price"] for item in items}
+            for market, items in markets.items()
+        }
         known = set(markets) - {""}
-        if len(known) > 1 or ("" in markets and len(set(markets.values())) > 1):
+        all_prices = {price for values in market_prices.values() for price in values}
+        if len(known) > 1 or len(all_prices) > 1:
             continue
-        result[goods_id] = next(iter(markets.values()))
+        if source_market and source_market in markets:
+            selected_market = source_market
+        elif len(known) == 1:
+            selected_market = next(iter(known))
+        else:
+            selected_market = ""
+        selected = markets[selected_market]
+        shops = {item["source_shop"] for item in selected if item["source_shop"]}
+        source_shop = next(iter(shops)) if len(shops) == 1 else ""
+        source_title = next(
+            (item["title"] for item in selected if item["title"]),
+            "",
+        )
+        result[goods_id] = {
+            "price": next(iter(all_prices)),
+            "source_shop": source_shop,
+            "source_title": source_title,
+        }
     return result
+
+
+def load_source_prices(settings: Settings, target_shop: str = "", source_market: str = "") -> dict[str, float]:
+    """兼容旧调用：只返回可靠货源价。"""
+    return {
+        goods_id: float(detail["price"])
+        for goods_id, detail in load_source_details(settings, target_shop, source_market).items()
+    }
 
 
 async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
@@ -57,7 +99,7 @@ async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
         raise ValueError("草稿发布必须指定 --target-shop，以核对店铺及保存发布记录")
     args.target_shop = args.target_shop.strip()
     args.source_market = args.source_market.strip().lower()
-    prices = load_source_prices(settings, args.target_shop, args.source_market)
+    source_details = load_source_details(settings, args.target_shop, args.source_market)
     ledger = DraftLedger(settings.database_path, args.target_shop, args.source_market)
     stem = "drafts-" + datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
     rows = []
@@ -80,7 +122,7 @@ async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
                     failures += previous == "uncertain"
                     rows.append(row)
                     continue
-                if sku not in prices:
+                if sku not in source_details:
                     row.update(状态="跳过", 原因="缺少可靠货源价，或多个来源站点价格不明确")
                     failures += 1
                     rows.append(row)
@@ -93,7 +135,15 @@ async def publish_drafts(args: argparse.Namespace, settings: Settings) -> int:
                     if edit_page is None:
                         raise RuntimeError("找不到草稿编辑入口")
                     await draft.wait_price_fields(edit_page)
-                    await draft.set_prices(edit_page, prices[sku], multiple)
+                    detail = source_details[sku]
+                    source_shop = str(detail["source_shop"])
+                    # 只有唯一确认来源档口时才清理标题；来源为空或有多个档口时，
+                    # 保留原标题，但不影响改价和后续提交。
+                    if source_shop:
+                        await draft.remove_source_shop_prefix(
+                            edit_page, source_shop, str(detail["source_title"]),
+                        )
+                    await draft.set_prices(edit_page, float(detail["price"]), multiple)
                     await draft.verify_shop(args.target_shop)
                     # 写入提交意图后才允许点击；异常退出也会拦截下次重发。
                     previous = ledger.reserve(sku)

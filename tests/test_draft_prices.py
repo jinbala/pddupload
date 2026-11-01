@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from playwright.async_api import async_playwright
 
-from pdd_listing_automation.pages.pdd_draft import PddDraftPage
+from pdd_listing_automation.pages.pdd_draft import PddDraftPage, remove_source_shop_prefix
 
 
 def test_price_editing_in_local_browser():
@@ -66,6 +66,60 @@ def test_price_editing_in_local_browser():
                 for factor in (0, -1, float("inf"), float("nan")):
                     with pytest.raises(ValueError, match="有限正数"):
                         await draft.set_prices(page, 20, factor)
+            finally:
+                await browser.close()
+    asyncio.run(scenario())
+
+
+def test_remove_source_shop_prefix_only_removes_leading_source_name():
+    assert remove_source_shop_prefix(
+        "汇兴达【随心裁莫代尔260克】上衣女", "汇兴达网购",
+    ) == "【随心裁莫代尔260克】上衣女"
+    assert remove_source_shop_prefix(
+        "汇 兴 达 【随心裁】上衣女", "汇兴达网购",
+    ) == "【随心裁】上衣女"
+    assert remove_source_shop_prefix(
+        "春季汇兴达款上衣女", "汇兴达网购",
+    ) == "春季汇兴达款上衣女"
+    assert remove_source_shop_prefix(
+        "汇兴达【随心裁】上衣女", "不相关档口",
+    ) == "汇兴达【随心裁】上衣女"
+
+
+def test_remove_source_shop_prefix_from_unique_title_field():
+    async def scenario():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                    <div class="ant-form-item"><label>商品标题</label>
+                      <input value="汇兴达【随心裁】上衣女"></div>
+                    <div class="ant-form-item"><label>商品副标题</label>
+                      <input value="不要改动"></div>
+                ''')
+                draft = PddDraftPage(page)
+                cleaned = await draft.remove_source_shop_prefix(page, "汇兴达网购")
+                assert cleaned == "【随心裁】上衣女"
+                assert await page.locator("input").nth(0).input_value() == "【随心裁】上衣女"
+                assert await page.locator("input").nth(1).input_value() == "不要改动"
+            finally:
+                await browser.close()
+    asyncio.run(scenario())
+
+
+def test_title_cleanup_stops_when_title_field_is_ambiguous():
+    async def scenario():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                    <div class="ant-form-item"><label>商品标题</label><input value="A"></div>
+                    <div class="ant-form-item"><label>商品标题</label><input value="B"></div>
+                ''')
+                with pytest.raises(RuntimeError, match="无法唯一定位"):
+                    await PddDraftPage(page).remove_source_shop_prefix(page, "汇兴达网购")
             finally:
                 await browser.close()
     asyncio.run(scenario())

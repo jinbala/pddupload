@@ -40,6 +40,65 @@ PRICE_FIELDS_JS = r"""() => {
   return {rows: out};
 }"""
 
+TITLE_FIELDS_JS = r"""() => {
+  const controls = Array.from(document.querySelectorAll('input, textarea'));
+  const rows = [];
+  for (const [index, el] of controls.entries()) {
+    if (el.disabled || el.readOnly || !el.getClientRects().length) continue;
+    const labels = el.labels ? Array.from(el.labels).map(label => label.textContent || '') : [];
+    const item = el.closest('.ant-form-item, [role="group"], label, td, li');
+    const nearby = item ? (item.innerText || '').slice(0, 240) : '';
+    const identity = [el.placeholder, el.name, el.id, el.getAttribute('aria-label')]
+      .filter(Boolean).join(' ');
+    const exactLabel = labels.some(label => /^(商品标题|商品名称)$/.test(label.trim()));
+    const identityMatch = /(商品标题|商品名称|goods[_-]?name|product[_-]?title)/i.test(identity);
+    const nearbyMatch = /商品标题/.test(nearby);
+    if (exactLabel || identityMatch || nearbyMatch) {
+      rows.push({index, value: el.value || ''});
+    }
+  }
+  return {rows};
+}"""
+
+
+def _compact_title_text(value: str) -> str:
+    return re.sub(r"[\s\u3000]+", "", value or "")
+
+
+def _source_shop_prefixes(source_shop: str, source_title: str = "") -> list[str]:
+    """生成来源档口可能出现在商品标题开头的前缀，最长优先。"""
+    shop = _compact_title_text(source_shop)
+    title = _compact_title_text(source_title)
+    if not shop:
+        return []
+    prefixes = {shop}
+    common = []
+    for left, right in zip(shop, title):
+        if left != right:
+            break
+        common.append(left)
+    if len(common) >= 2:
+        prefixes.add("".join(common))
+    for suffix in ("旗舰店", "专营店", "专卖店", "供应链", "网购", "网店", "服饰", "服装",
+                   "女装", "男装", "商贸", "贸易", "制衣", "针织", "纺织", "店"):
+        if shop.endswith(suffix) and len(shop) - len(suffix) >= 2:
+            prefixes.add(shop[:-len(suffix)])
+    return sorted(prefixes, key=len, reverse=True)
+
+
+def remove_source_shop_prefix(title: str, source_shop: str, source_title: str = "") -> str:
+    """只删除标题开头的来源档口名，不修改标题主体或中间出现的同名词。"""
+    original = (title or "").strip()
+    for prefix in _source_shop_prefixes(source_shop, source_title):
+        pattern = r"^\s*" + r"[\s\u3000]*".join(re.escape(char) for char in prefix)
+        match = re.match(pattern, original)
+        if not match:
+            continue
+        cleaned = re.sub(r"^[\s\u3000\-_|:：/]+", "", original[match.end():])
+        if cleaned:
+            return cleaned
+    return original
+
 
 class PddDraftPage:
     """拼多多商家后台「草稿箱」，完成「改价 + 提交并上架」最后一步。"""
@@ -122,6 +181,25 @@ class PddDraftPage:
         if result.get("error") or not result.get("rows"):
             raise RuntimeError(result.get("error") or "未识别到规格价格表，停止改价和提交")
         return result["rows"]
+
+    async def remove_source_shop_prefix(
+        self, edit_page: Page, source_shop: str, source_title: str = "",
+    ) -> str:
+        """清理草稿标题开头的来源档口名；标题控件不唯一时停止提交。"""
+        result = await edit_page.evaluate(TITLE_FIELDS_JS)
+        rows = result.get("rows", [])
+        if len(rows) != 1:
+            raise RuntimeError("商品标题输入框无法唯一定位，停止清理标题和提交")
+        field = edit_page.locator("input, textarea").nth(rows[0]["index"])
+        current = await field.input_value()
+        cleaned = remove_source_shop_prefix(current, source_shop, source_title)
+        if cleaned == current:
+            return current
+        await field.fill(cleaned)
+        await field.blur()
+        if await field.input_value() != cleaned:
+            raise RuntimeError("商品标题写入后校验不一致，停止提交")
+        return cleaned
 
     async def set_prices(self, edit_page: Page, source_price: float, multiple: float) -> None:
         """最低拼单价=货源价×倍数，其余规格和单买价保留原来的金额差。"""
